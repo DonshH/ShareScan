@@ -29,6 +29,8 @@ param (
     [int]$throttle = 2
 )
 
+$ProgressPreference = 'Continue'
+
 $keywords = @(
     'password','secret','confidential','private','credential','key','token','backup','export','database','db',
     'admin','login','user','account','creditcard','ssn','id','identity','bank','finance','payroll','tax','hr',
@@ -105,10 +107,11 @@ $tableSchema | sqlite3 "$dbPath"
 # ────────────────────────────────────────────────────────────────
 
 $syncProgress = [System.Collections.Hashtable]::Synchronized(@{
-    IPs     = @{ Current = 0; Total = 0; Status = "Initializing..." }
+    IPs      = @{ Current = 0; Total = 0; Status = "Initializing..." }
     CurrentIP = ""
-    Shares  = @{}   # server → @{Current=; Total=; Status=}
-    Files   = @{}   # "server\share" → @{Current=; Total=; Status=; FileName=""}
+    Shares   = @{}   # server → @{Current=; Total=; Status=}
+    Files    = @{}   # "server\share" → @{Current=; Total=; Status=; FileName=""}
+    LogQueue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
 })
 
 $lock = [System.Object]::new()
@@ -127,7 +130,7 @@ foreach ($server in $servers) {
     $syncProgress.IPs.Current++
     $syncProgress.IPs.Status = "Processing $server ($($syncProgress.IPs.Current)/$($syncProgress.IPs.Total))"
     $syncProgress.CurrentIP = $server
-
+    Start-Sleep -Milliseconds 800
     $ipJobs += Start-ThreadJob -ThrottleLimit $throttle -ArgumentList $server -ScriptBlock {
 
         $server          = $args[0]
@@ -279,11 +282,10 @@ foreach ($server in $servers) {
 	}
 
 
-        Write-Host "Scanning $server ..." -ForegroundColor Cyan
-
+        $syncProgress.LogQueue.Enqueue(@{ Msg = "Scanning $server ..."; Color = "Cyan" })
         $shares = Get-ShareNames $server
         if (-not $shares) {
-            Write-Host "No shares found or access denied on $server" -ForegroundColor Yellow
+            $syncProgress.LogQueue.Enqueue(@{ Msg = "No shares found or access denied on $server"; Color = "Yellow" })
             return
         }
 
@@ -291,8 +293,7 @@ foreach ($server in $servers) {
 
         foreach ($share in $shares) {
             $searchPath = "\\$server\$share"
-            Write-Host "  Scanning $searchPath ..." -ForegroundColor Cyan
-
+            $syncProgress.LogQueue.Enqueue(@{ Msg = "  Scanning $searchPath ..."; Color = "Cyan" })
             $syncProgress.Shares[$server].Current++
             $syncProgress.Shares[$server].Status = "Share $($syncProgress.Shares[$server].Current)/$($shares.Count) - $share"
 
@@ -300,8 +301,7 @@ foreach ($server in $servers) {
             $problems = @()
             $tempAllPaths = Get-AllFiles -RootPath $searchPath -ErrorList ([ref]$problems)
 
-            Write-Host "    $($tempAllPaths.Count) files found in $share"
-
+            $syncProgress.LogQueue.Enqueue(@{ Msg = "    $($tempAllPaths.Count) files found in $share"; Color = $null })
             $syncProgress.Files[$fileKey] = @{
                 Current   = 0
                 Total     = $tempAllPaths.Count
@@ -333,7 +333,7 @@ foreach ($server in $servers) {
                     $lock         = $using:lock
 
                     $syncProgress.Files[$fileKey].FileName = $file.Name
-                    Write-Host "    Scanning $($file.FullName)..." -ForegroundColor Cyan
+                    $syncProgress.LogQueue.Enqueue(@{ Msg = "    Scanning $($file.FullName)..."; Color = "Cyan" })
                     try {
                         # ── Check filename for keywords ────────────────────────
                         foreach ($kw in $keywords) {
@@ -414,7 +414,7 @@ foreach ($server in $servers) {
             }
 
             # Wait for all file jobs in this share
-            $fileJobs | Wait-Job | Receive-Job -Wait -AutoRemoveJob | Out-Null
+            $fileJobs | Wait-Job | Remove-Job -Force
 
             # Report enumeration errors
             foreach ($prob in $problems) {
@@ -436,27 +436,61 @@ foreach ($server in $servers) {
 
         # Clear share progress after IP is done
         $syncProgress.Shares.Remove($server)
-        Write-Host "$server completed" -ForegroundColor Green
+        $syncProgress.LogQueue.Enqueue(@{ Msg = "$server completed"; Color = "Green" })
     }
 }
 
 # ────────────────────────────────────────────────────────────────
-#   MAIN MONITORING LOOP - Display 3 progress bars
+#   Wait until at least one job is actually running
+# ────────────────────────────────────────────────────────────────
+
+Write-Host "All jobs launched. Waiting for at least one to enter Running state..." -ForegroundColor Cyan
+
+$timeoutSeconds = 15
+$start = Get-Date
+$runningFound = $false
+
+while (((Get-Date) - $start).TotalSeconds -lt $timeoutSeconds) {
+    $running = $ipJobs | Where-Object { $_.State -eq 'Running' }
+    if ($running) {
+        $runningFound = $true
+        $syncProgress.LogQueue.Enqueue(@{ Msg = "Found $($running.Count) running jobs. Starting monitoring."; Color = "Green" })
+        break
+    }
+    Start-Sleep -Milliseconds 500
+}
+
+if (-not $runningFound) {
+    $syncProgress.LogQueue.Enqueue(@{ Msg = "No jobs entered Running state within $timeoutSeconds seconds. All jobs already completed or failed."; Color = "Red" })
+    # You can add debugging here: $ipJobs | Format-List Name, State, Command, HasMoreData
+}
+
+# ────────────────────────────────────────────────────────────────
+#   MAIN MONITORING LOOP
 # ────────────────────────────────────────────────────────────────
 
 $parentId = 10
 
 try {
     while ($ipJobs | Where-Object { $_.State -eq 'Running' }) {
+        # ── Flush buffered Write-Host output from all jobs in real time ──
+        # Receive-Job (without -AutoRemoveJob) drains pending output each tick,
+        # preserving Write-Host colors. PowerShell renders it above the progress bars.
+        # Drain the log queue — real-time Write-Host from all thread jobs
+        $logItem = $null
+        while ($syncProgress.LogQueue.TryDequeue([ref]$logItem)) {
+            if ($logItem.Color) { Write-Host $logItem.Msg -ForegroundColor $logItem.Color }
+            else                { Write-Host $logItem.Msg }
+        }
 
-        # Bar 1: IPs (top level)
+        # Bar 1: IPs
         $ip = $syncProgress.IPs
         Write-Progress -Id $parentId `
                        -Activity "Scanning Network Shares" `
                        -Status "IP $($ip.Current)/$($ip.Total) - $($ip.Status)" `
                        -PercentComplete ([math]::Round(($ip.Current / $ip.Total)*100, 1))
 
-        # Bar 2: Shares on current IP
+        # Bar 2: Shares
         if ($syncProgress.CurrentIP -and $syncProgress.Shares.ContainsKey($syncProgress.CurrentIP)) {
             $sh = $syncProgress.Shares[$syncProgress.CurrentIP]
             Write-Progress -Id ($parentId + 1) `
@@ -466,30 +500,32 @@ try {
                            -PercentComplete ([math]::Round(($sh.Current / $sh.Total)*100, 1))
         }
 
-        # Bar 3: Files in current share
-        $activeFileKey = $syncProgress.Files.Keys | Where-Object { $syncProgress.Files[$_].Current -gt 0 -and $syncProgress.Files[$_].Current -lt $syncProgress.Files[$_].Total } | Select-Object -First 1
-        if ($activeFileKey) {
-            $f = $syncProgress.Files[$activeFileKey]
-            $shareName = $activeFileKey.Split('\')[1]
+        # Bar 3: Files
+        $activeKey = $syncProgress.Files.Keys | Where-Object { $syncProgress.Files[$_].Current -gt 0 -and $syncProgress.Files[$_].Current -lt $syncProgress.Files[$_].Total } | Select-Object -First 1
+        if ($activeKey) {
+            $f = $syncProgress.Files[$activeKey]
+            $shareName = $activeKey.Split('\')[1]
             Write-Progress -Id ($parentId + 2) `
                            -ParentId ($parentId + 1) `
                            -Activity "Files in $shareName" `
-                           -Status "$($f.Status)  ($($f.Current)/$($f.Total))" `
+                           -Status "$($f.Status) ($($f.Current)/$($f.Total))" `
                            -PercentComplete ([math]::Round(($f.Current / $f.Total)*100, 1))
         }
 
-        Start-Sleep -Milliseconds 200
+        Start-Sleep -Milliseconds 300
     }
 }
 finally {
-    # Clean up progress bars
-    Write-Progress -Id $parentId       -Completed
-    Write-Progress -Id ($parentId + 1) -Completed
-    Write-Progress -Id ($parentId + 2) -Completed
+    10..12 | ForEach-Object { Write-Progress -Id $_ -Completed }
 }
 
-# Final wait & cleanup
-$ipJobs | Wait-Job | Receive-Job -Wait -AutoRemoveJob | Out-Null
+# Cleanup — drain any remaining log queue entries then remove jobs
+$ipJobs | Wait-Job -ErrorAction SilentlyContinue | Out-Null
+$logItem = $null
+while ($syncProgress.LogQueue.TryDequeue([ref]$logItem)) {
+    if ($logItem.Color) { Write-Host $logItem.Msg -ForegroundColor $logItem.Color }
+    else                { Write-Host $logItem.Msg }
+}
 $ipJobs | Remove-Job -Force -ErrorAction SilentlyContinue
 
 Write-Host "`nScan completed." -ForegroundColor Green
