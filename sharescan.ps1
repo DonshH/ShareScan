@@ -312,10 +312,6 @@ foreach ($server in $servers) {
             $fileJobs = @()
 
             foreach ($foundfile in $tempAllPaths) {
-                $syncProgress.Files[$fileKey].Current++
-                $syncProgress.Files[$fileKey].FileName = $foundfile.Name
-                $syncProgress.Files[$fileKey].Status   = "File $($syncProgress.Files[$fileKey].Current)/$($tempAllPaths.Count) - $($foundfile.Name)"
-                
                 $fileJobs += Start-ThreadJob -ThrottleLimit 4 -ArgumentList $foundfile, $server, $share, (Get-Date -Format "MM/dd/yyyy HH:mm:ss"), $fileKey -ScriptBlock {
 
                     $file         = $args[0]
@@ -332,7 +328,6 @@ foreach ($server in $servers) {
                     $tableName    = $using:tableName
                     $lock         = $using:lock
 
-                    $syncProgress.Files[$fileKey].FileName = $file.Name
                     $syncProgress.LogQueue.Enqueue(@{ Msg = "    Scanning $($file.FullName)..."; Color = "Cyan" })
                     try {
                         # ── Check filename for keywords ────────────────────────
@@ -410,6 +405,11 @@ foreach ($server in $servers) {
                             $insert | sqlite3 $dbPath
                         } finally { [System.Threading.Monitor]::Exit($lock) }
                     }
+
+                    # ── Update file progress (counted on completion, not launch) ──
+                    [System.Threading.Interlocked]::Increment([ref]$syncProgress.Files[$fileKey].Current) | Out-Null
+                    $syncProgress.Files[$fileKey].FileName = $file.Name
+                    $syncProgress.Files[$fileKey].Status   = "File $($syncProgress.Files[$fileKey].Current)/$($syncProgress.Files[$fileKey].Total) - $($file.Name)"
                 }
             }
 
@@ -501,15 +501,18 @@ try {
         }
 
         # Bar 3: Files
-        $activeKey = $syncProgress.Files.Keys | Where-Object { $syncProgress.Files[$_].Current -gt 0 -and $syncProgress.Files[$_].Current -lt $syncProgress.Files[$_].Total } | Select-Object -First 1
+        $activeKey = $syncProgress.Files.Keys | Where-Object { $syncProgress.Files[$_].Total -gt 0 } | Select-Object -First 1
         if ($activeKey) {
             $f = $syncProgress.Files[$activeKey]
             $shareName = $activeKey.Split('\')[1]
+            $pct = [math]::Round(($f.Current / $f.Total) * 100, 1)
             Write-Progress -Id ($parentId + 2) `
                            -ParentId ($parentId + 1) `
                            -Activity "Files in $shareName" `
-                           -Status "$($f.Status) ($($f.Current)/$($f.Total))" `
-                           -PercentComplete ([math]::Round(($f.Current / $f.Total)*100, 1))
+                           -Status "File $($f.Current)/$($f.Total)" `
+                           -PercentComplete $pct
+        } else {
+            Write-Progress -Id ($parentId + 2) -ParentId ($parentId + 1) -Activity "Files" -Completed
         }
 
         Start-Sleep -Milliseconds 300
