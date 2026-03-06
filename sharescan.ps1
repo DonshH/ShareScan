@@ -305,28 +305,26 @@ foreach ($server in $servers) {
             $syncProgress.Files[$fileKey] = @{
                 Current   = 0
                 Total     = $tempAllPaths.Count
-                Status    = "Starting file scan..."
                 FileName  = ""
             }
 
             $fileJobs = @()
 
             foreach ($foundfile in $tempAllPaths) {
-                $fileJobs += Start-ThreadJob -ThrottleLimit 4 -ArgumentList $foundfile, $server, $share, (Get-Date -Format "MM/dd/yyyy HH:mm:ss"), $fileKey -ScriptBlock {
+                $fileJobs += Start-ThreadJob -ThrottleLimit 4 -ArgumentList $foundfile, $server, $share, (Get-Date -Format "MM/dd/yyyy HH:mm:ss"), $fileKey, $syncProgress, $lock, $keywords, $fileExtensions, $outputCsvFile, $dbPath, $tableName -ScriptBlock {
 
-                    $file         = $args[0]
-                    $server       = $args[1]
-                    $share        = $args[2]
-                    $timestamp    = $args[3]
-                    $fileKey      = $args[4]
-
-                    $syncProgress = $using:syncProgress
-                    $keywords     = $using:keywords
-                    $fileExtensions = $using:fileExtensions
-                    $outputCsvFile = $using:outputCsvFile
-                    $dbPath       = $using:dbPath
-                    $tableName    = $using:tableName
-                    $lock         = $using:lock
+                    $file           = $args[0]
+                    $server         = $args[1]
+                    $share          = $args[2]
+                    $timestamp      = $args[3]
+                    $fileKey        = $args[4]
+                    $syncProgress   = $args[5]
+                    $lock           = $args[6]
+                    $keywords       = $args[7]
+                    $fileExtensions = $args[8]
+                    $outputCsvFile  = $args[9]
+                    $dbPath         = $args[10]
+                    $tableName      = $args[11]
 
                     $syncProgress.LogQueue.Enqueue(@{ Msg = "    Scanning $($file.FullName)..."; Color = "Cyan" })
                     try {
@@ -407,9 +405,8 @@ foreach ($server in $servers) {
                     }
 
                     # ── Update file progress (counted on completion, not launch) ──
-                    [System.Threading.Interlocked]::Increment([ref]$syncProgress.Files[$fileKey].Current) | Out-Null
+                    $syncProgress.Files[$fileKey].Current++
                     $syncProgress.Files[$fileKey].FileName = $file.Name
-                    $syncProgress.Files[$fileKey].Status   = "File $($syncProgress.Files[$fileKey].Current)/$($syncProgress.Files[$fileKey].Total) - $($file.Name)"
                 }
             }
 
