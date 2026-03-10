@@ -318,15 +318,15 @@ foreach ($server in $servers) {
             $fileJobs = @()
 
             foreach ($foundfile in $tempAllPaths) {
-                $fileJobs += Start-ThreadJob -ThrottleLimit 4 -ArgumentList $foundfile, $server, $share, $timestamp, $fileKey, $fileCounter, $syncProgress, $lock, $keywords, $fileExtensions, $outputCsvFile, $dbPath, $tableName -ScriptBlock {
+                $fileJobs += Start-ThreadJob -ThrottleLimit 4 -ArgumentList $foundfile, $server, $share, $timestamp, $fileKey, $fileCounter, $syncProgress.LogQueue, $lock, $keywords, $fileExtensions, $outputCsvFile, $dbPath, $tableName -ScriptBlock {
 
                     $file           = $args[0]
                     $server         = $args[1]
                     $share          = $args[2]
                     $timestamp      = $args[3]
                     $fileKey        = $args[4]
-                    $fileCounter    = $args[5]   # ConcurrentDictionary[string,int] — atomic int, survives serialization
-                    $syncProgress   = $args[6]
+                    $fileCounter    = $args[5]   # ConcurrentDictionary[string,int] — survives serialization
+                    $logQueue       = $args[6]   # ConcurrentQueue — survives serialization, enqueues reach main thread
                     $lock           = $args[7]
                     $keywords       = $args[8]
                     $fileExtensions = $args[9]
@@ -334,7 +334,7 @@ foreach ($server in $servers) {
                     $dbPath         = $args[11]
                     $tableName      = $args[12]
 
-                    $syncProgress.LogQueue.Enqueue(@{ Msg = "    Scanning $($file.FullName)..."; Color = "Cyan" })
+                    $logQueue.Enqueue(@{ Msg = "    Scanning $($file.FullName)..."; Color = "Cyan" })
                     $fileCounter.AddOrUpdate($fileKey, 1, [Func[string, int, int]]{ param($k, $v) $v + 1 }) | Out-Null
                     try {
                         # ── 1. Filename keyword scan ──────────────────────────
