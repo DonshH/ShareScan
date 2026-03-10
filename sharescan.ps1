@@ -148,8 +148,6 @@ foreach ($server in $servers) {
         $tableName       = $using:tableName
         $lock            = $using:lock
 
-        # CurrentIP updated here so the share bar knows which IP is active
-        $syncProgress.CurrentIP = $server
     # ────────────────────────────────────────────────────────────────
     #   FUNCTION: Enumerate files (with batch parallel processing)
     # ────────────────────────────────────────────────────────────────
@@ -291,7 +289,9 @@ foreach ($server in $servers) {
 	}
 
 
+        $syncProgress.CurrentIP = $server
         $syncProgress.LogQueue.Enqueue(@{ Msg = "Scanning $server ..."; Color = "Cyan" })
+
         $shares = Get-ShareNames $server
         if (-not $shares) {
             $syncProgress.LogQueue.Enqueue(@{ Msg = "No shares found or access denied on $server"; Color = "Yellow" })
@@ -335,6 +335,7 @@ foreach ($server in $servers) {
                     $tableName      = $args[12]
 
                     $syncProgress.LogQueue.Enqueue(@{ Msg = "    Scanning $($file.FullName)..."; Color = "Cyan" })
+                    $fileCounter.AddOrUpdate($fileKey, 1, [Func[string, int, int]]{ param($k, $v) $v + 1 }) | Out-Null
                     try {
                         # ── 1. Filename keyword scan ──────────────────────────
                         $nameMatches = @($keywords.Where{ $file.FullName -match [regex]::Escape($_) })
@@ -404,9 +405,7 @@ foreach ($server in $servers) {
                         } finally { [System.Threading.Monitor]::Exit($lock) }
                     }
 
-                    # ── Update file progress ──────────────────────────────────
-                    # fileCounter holds int values — AddOrUpdate on int is truly atomic across thread boundaries.
-                    $fileCounter.AddOrUpdate($fileKey, 1, [Func[string, int, int]]{ param($k, $v) $v + 1 }) | Out-Null
+
                 }
             }
 
@@ -432,7 +431,6 @@ foreach ($server in $servers) {
             $null = $fileCounter.TryRemove($fileKey, [ref]$null)
         }
 
-        # Clear share progress after IP is done
         $syncProgress.Shares.Remove($server)
         $syncProgress.IPs.Current++
         $syncProgress.IPs.Status = "$server completed ($($syncProgress.IPs.Current)/$($syncProgress.IPs.Total))"
@@ -473,10 +471,7 @@ $parentId = 10
 
 try {
     while ($ipJobs | Where-Object { $_.State -eq 'Running' }) {
-        # ── Flush buffered Write-Host output from all jobs in real time ──
-        # Receive-Job (without -AutoRemoveJob) drains pending output each tick,
-        # preserving Write-Host colors. PowerShell renders it above the progress bars.
-        # Drain the log queue — real-time Write-Host from all thread jobs
+        # ── Flush log queue ────────────────────────────────────────
         $logItem = $null
         while ($syncProgress.LogQueue.TryDequeue([ref]$logItem)) {
             if ($logItem.Color) { Write-Host $logItem.Msg -ForegroundColor $logItem.Color }
@@ -500,18 +495,22 @@ try {
                            -PercentComplete ([math]::Round(($sh.Current / $sh.Total)*100, 1))
         }
 
-        # Bar 3: Files
-        $activeKey = $fileProgress.Keys | Where-Object { $fileProgress[$_].Total -gt 0 } | Select-Object -First 1
+        # Bar 3: Files — only show a share that has actually started (counter > 0)
+        $activeKey = $fileProgress.Keys | Where-Object {
+            $c = 0
+            $fileCounter.TryGetValue($_, [ref]$c) | Out-Null
+            $c -gt 0
+        } | Select-Object -First 1
+
         if ($activeKey) {
             $f = $fileProgress[$activeKey]
-            $shareName = $activeKey.Split('\')[1]
             $currentCount = 0
             $fileCounter.TryGetValue($activeKey, [ref]$currentCount) | Out-Null
             $pct = if ($f.Total -gt 0) { [math]::Round(($currentCount / $f.Total) * 100, 1) } else { 0 }
             Write-Progress -Id ($parentId + 2) `
                            -ParentId ($parentId + 1) `
-                           -Activity "Files in $shareName" `
-                           -Status "File $currentCount/$($f.Total)$(if ($f.FileName) { ' - ' + $f.FileName })" `
+                           -Activity "Files in $activeKey" `
+                           -Status "File $currentCount/$($f.Total)" `
                            -PercentComplete $pct
         } else {
             Write-Progress -Id ($parentId + 2) -ParentId ($parentId + 1) -Activity "Files" -Completed
