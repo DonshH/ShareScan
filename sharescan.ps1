@@ -110,13 +110,15 @@ $syncProgress = [System.Collections.Hashtable]::Synchronized(@{
     IPs      = @{ Current = 0; Total = 0; Status = "Initializing..." }
     CurrentIP = ""
     Shares   = @{}   # server → @{Current=; Total=; Status=}
-    Files    = @{}   # "server\share" → @{Total=; FileName=""}  (written only by IP job via $using:)
     LogQueue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
 })
 
-# Atomic file counter — ConcurrentDictionary[string,int] passed via -ArgumentList to nested jobs.
-# int is a value type: AddOrUpdate on it is truly atomic and survives the serialization boundary.
-# Kept separate from syncProgress.Files because syncProgress itself cannot be passed via -ArgumentList.
+# ConcurrentDictionary so the monitoring loop can safely enumerate keys while the IP job writes entries.
+# "server\share" → @{Total=; FileName=""}
+$fileProgress = [System.Collections.Concurrent.ConcurrentDictionary[string, hashtable]]::new()
+
+# Atomic int counter per share — passed via -ArgumentList to nested file jobs so the live reference survives serialization.
+# int values are safe: AddOrUpdate on an int is truly atomic across thread boundaries.
 $fileCounter = [System.Collections.Concurrent.ConcurrentDictionary[string, int]]::new()
 
 $lock = [System.Object]::new()
@@ -132,10 +134,11 @@ $ipJobs = @()
 # ────────────────────────────────────────────────────────────────
 
 foreach ($server in $servers) {
-    $ipJobs += Start-ThreadJob -ThrottleLimit $throttle -ArgumentList $server, $fileCounter -ScriptBlock {
+    $ipJobs += Start-ThreadJob -ThrottleLimit $throttle -ArgumentList $server, $fileCounter, $fileProgress -ScriptBlock {
 
         $server          = $args[0]
         $fileCounter     = $args[1]   # ConcurrentDictionary[string,int] — atomic int counter, survives serialization
+        $fileProgress    = $args[2]   # ConcurrentDictionary[string,hashtable] — safe for cross-thread key enumeration
         $syncProgress    = $using:syncProgress
         $keywords        = $using:keywords
         $fileExtensions  = $using:fileExtensions
@@ -145,7 +148,7 @@ foreach ($server in $servers) {
         $lock            = $using:lock
 
         # Update IP progress now that this job is actually running
-        [System.Threading.Interlocked]::Increment([ref]$syncProgress.IPs.Current) | Out-Null
+        $syncProgress.IPs.Current++
         $syncProgress.IPs.Status = "Processing $server ($($syncProgress.IPs.Current)/$($syncProgress.IPs.Total))"
         $syncProgress.CurrentIP  = $server
     # ────────────────────────────────────────────────────────────────
@@ -310,7 +313,7 @@ foreach ($server in $servers) {
             $tempAllPaths = Get-AllFiles -RootPath $searchPath -ErrorList ([ref]$problems)
 
             $syncProgress.LogQueue.Enqueue(@{ Msg = "    $($tempAllPaths.Count) files found in $share"; Color = $null })
-            $syncProgress.Files[$fileKey] = @{ Total = $tempAllPaths.Count; FileName = "" }
+            $fileProgress[$fileKey] = @{ Total = $tempAllPaths.Count; FileName = "" }
             $fileCounter[$fileKey] = 0
 
             $fileJobs = @()
@@ -392,17 +395,29 @@ foreach ($server in $servers) {
                         $content = Get-Content $file.FullName -Raw -ErrorAction Stop
                         $contentMatches = @($keywords.Where{ $content -match [regex]::Escape($_) })
 
-                        # Merge filename + content matches, dedupe, write single row
-                        $allMatches = @($nameMatches + $contentMatches | Select-Object -Unique)
-                        if ($allMatches.Count -gt 0) {
+                        # ACL fetched once if either match type fires
+                        if ($nameMatches.Count -gt 0 -or $contentMatches.Count -gt 0) {
                             $acl = try { Get-Acl $file.FullName } catch { $null }
                             $perms = if ($acl) { ($acl.Access | ForEach-Object { "$($_.IdentityReference):$($_.FileSystemRights)" }) -join "; " } else { "Error: permissions" }
-                            $foundStr = $allMatches -join ","
-                            $source = if ($nameMatches.Count -gt 0 -and $contentMatches.Count -gt 0) { "Keyword in filename and content" }
-                                      elseif ($nameMatches.Count -gt 0)                               { "Keyword in filename" }
-                                      else                                                             { "" }
-                            $line = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),""$perms"",""$foundStr"",""$source"""
-                            $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','$($perms -replace "'","''")','$($foundStr -replace "'","''")','$($source -replace "'","''")');"
+                        }
+
+                        # ── Row 1: filename match ──────────────────────────────
+                        if ($nameMatches.Count -gt 0) {
+                            $foundStr = $nameMatches -join ","
+                            $line = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),""$perms"",""$foundStr"",Keyword in filename"
+                            $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','$($perms -replace "'","''")','$($foundStr -replace "'","''")','Keyword in filename');"
+                            [System.Threading.Monitor]::Enter($lock)
+                            try {
+                                $line | Out-File $outputCsvFile -Append -Encoding utf8
+                                $insert | sqlite3 $dbPath
+                            } finally { [System.Threading.Monitor]::Exit($lock) }
+                        }
+
+                        # ── Row 2: content match ───────────────────────────────
+                        if ($contentMatches.Count -gt 0) {
+                            $foundStr = $contentMatches -join ","
+                            $line = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),""$perms"",""$foundStr"","
+                            $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','$($perms -replace "'","''")','$($foundStr -replace "'","''")','');"
                             [System.Threading.Monitor]::Enter($lock)
                             try {
                                 $line | Out-File $outputCsvFile -Append -Encoding utf8
@@ -447,7 +462,7 @@ foreach ($server in $servers) {
             }
 
             # Clear file progress after share is done
-            $syncProgress.Files.Remove($fileKey)
+            $null = $fileProgress.TryRemove($fileKey, [ref]$null)
             $null = $fileCounter.TryRemove($fileKey, [ref]$null)
         }
 
@@ -518,9 +533,9 @@ try {
         }
 
         # Bar 3: Files
-        $activeKey = $syncProgress.Files.Keys | Where-Object { $syncProgress.Files[$_].Total -gt 0 } | Select-Object -First 1
+        $activeKey = $fileProgress.Keys | Where-Object { $fileProgress[$_].Total -gt 0 } | Select-Object -First 1
         if ($activeKey) {
-            $f = $syncProgress.Files[$activeKey]
+            $f = $fileProgress[$activeKey]
             $shareName = $activeKey.Split('\')[1]
             $currentCount = 0
             $fileCounter.TryGetValue($activeKey, [ref]$currentCount) | Out-Null
