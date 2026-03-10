@@ -110,9 +110,13 @@ $syncProgress = [System.Collections.Hashtable]::Synchronized(@{
     IPs      = @{ Current = 0; Total = 0; Status = "Initializing..." }
     CurrentIP = ""
     Shares   = @{}   # server → @{Current=; Total=; Status=}
-    Files    = @{}   # "server\share" → @{Current=; Total=; Status=; FileName=""}
+    Files    = @{}   # "server\share" → @{Total=; FileName=""}
     LogQueue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
 })
+
+# Separate concurrent dictionary for file counters — survives thread-job serialization
+# and supports atomic increments from nested thread jobs.
+$fileCounters = [System.Collections.Concurrent.ConcurrentDictionary[string,int]]::new()
 
 $lock = [System.Object]::new()
 
@@ -131,9 +135,10 @@ foreach ($server in $servers) {
     $syncProgress.IPs.Status = "Processing $server ($($syncProgress.IPs.Current)/$($syncProgress.IPs.Total))"
     $syncProgress.CurrentIP = $server
     Start-Sleep -Milliseconds 800
-    $ipJobs += Start-ThreadJob -ThrottleLimit $throttle -ArgumentList $server -ScriptBlock {
+    $ipJobs += Start-ThreadJob -ThrottleLimit $throttle -ArgumentList $server, $fileCounters -ScriptBlock {
 
         $server          = $args[0]
+        $fileCounters    = $args[1]   # ConcurrentDictionary — survives serialization, atomically incrementable
         $syncProgress    = $using:syncProgress
         $keywords        = $using:keywords
         $fileExtensions  = $using:fileExtensions
@@ -169,7 +174,7 @@ foreach ($server in $servers) {
 				$ErrorList.Value += @{
 					TargetObject = $RootPath
 					Exception    = $_.Exception
-					Message      = $_.Exception.Message
+					Message      = "Error on Accessing"
 				}
 			}
 		}
@@ -292,6 +297,7 @@ foreach ($server in $servers) {
         $syncProgress.Shares[$server] = @{ Current = 0; Total = $shares.Count; Status = "Starting shares..." }
 
         foreach ($share in $shares) {
+            $timestamp = (Get-Date -Format "MM/dd/yyyy HH:mm:ss")
             $searchPath = "\\$server\$share"
             $syncProgress.LogQueue.Enqueue(@{ Msg = "  Scanning $searchPath ..."; Color = "Cyan" })
             $syncProgress.Shares[$server].Current++
@@ -303,28 +309,30 @@ foreach ($server in $servers) {
 
             $syncProgress.LogQueue.Enqueue(@{ Msg = "    $($tempAllPaths.Count) files found in $share"; Color = $null })
             $syncProgress.Files[$fileKey] = @{
-                Current   = 0
                 Total     = $tempAllPaths.Count
                 FileName  = ""
             }
+            # Initialise / reset the atomic counter for this share
+            $fileCounters[$fileKey] = 0
 
             $fileJobs = @()
 
             foreach ($foundfile in $tempAllPaths) {
-                $fileJobs += Start-ThreadJob -ThrottleLimit 4 -ArgumentList $foundfile, $server, $share, (Get-Date -Format "MM/dd/yyyy HH:mm:ss"), $fileKey, $syncProgress, $lock, $keywords, $fileExtensions, $outputCsvFile, $dbPath, $tableName -ScriptBlock {
+                $fileJobs += Start-ThreadJob -ThrottleLimit 4 -ArgumentList $foundfile, $server, $share, $timestamp, $fileKey, $fileCounters, $syncProgress, $lock, $keywords, $fileExtensions, $outputCsvFile, $dbPath, $tableName -ScriptBlock {
 
                     $file           = $args[0]
                     $server         = $args[1]
                     $share          = $args[2]
                     $timestamp      = $args[3]
                     $fileKey        = $args[4]
-                    $syncProgress   = $args[5]
-                    $lock           = $args[6]
-                    $keywords       = $args[7]
-                    $fileExtensions = $args[8]
-                    $outputCsvFile  = $args[9]
-                    $dbPath         = $args[10]
-                    $tableName      = $args[11]
+                    $fileCounters   = $args[5]   # ConcurrentDictionary for atomic file count
+                    $syncProgress   = $args[6]
+                    $lock           = $args[7]
+                    $keywords       = $args[8]
+                    $fileExtensions = $args[9]
+                    $outputCsvFile  = $args[10]
+                    $dbPath         = $args[11]
+                    $tableName      = $args[12]
 
                     $syncProgress.LogQueue.Enqueue(@{ Msg = "    Scanning $($file.FullName)..."; Color = "Cyan" })
                     try {
@@ -404,8 +412,9 @@ foreach ($server in $servers) {
                         } finally { [System.Threading.Monitor]::Exit($lock) }
                     }
 
-                    # ── Update file progress (counted on completion, not launch) ──
-                    $syncProgress.Files[$fileKey].Current++
+                    # ── Update file progress atomically ───────────────────────
+                    # AddOrUpdate with +1 delta is the ConcurrentDictionary atomic increment pattern.
+                    $fileCounters.AddOrUpdate($fileKey, 1, [Func[string,int,int]]{ param($k,$v) $v + 1 }) | Out-Null
                     $syncProgress.Files[$fileKey].FileName = $file.Name
                 }
             }
@@ -429,6 +438,7 @@ foreach ($server in $servers) {
 
             # Clear file progress after share is done
             $syncProgress.Files.Remove($fileKey)
+            $null = $fileCounters.TryRemove($fileKey, [ref]$null)
         }
 
         # Clear share progress after IP is done
@@ -502,11 +512,13 @@ try {
         if ($activeKey) {
             $f = $syncProgress.Files[$activeKey]
             $shareName = $activeKey.Split('\')[1]
-            $pct = [math]::Round(($f.Current / $f.Total) * 100, 1)
+            $currentCount = 0
+            $fileCounters.TryGetValue($activeKey, [ref]$currentCount) | Out-Null
+            $pct = [math]::Round(($currentCount / $f.Total) * 100, 1)
             Write-Progress -Id ($parentId + 2) `
                            -ParentId ($parentId + 1) `
                            -Activity "Files in $shareName" `
-                           -Status "File $($f.Current)/$($f.Total)" `
+                           -Status "File $currentCount/$($f.Total)$(if ($f.FileName) { ' - ' + $f.FileName })" `
                            -PercentComplete $pct
         } else {
             Write-Progress -Id ($parentId + 2) -ParentId ($parentId + 1) -Activity "Files" -Completed
