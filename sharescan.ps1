@@ -127,6 +127,7 @@ $servers = Get-Content $serverList -ErrorAction Stop
 $syncProgress.IPs.Total = $servers.Count
 
 $ipJobs = @()
+$scanStart = Get-Date
 
 
 # ────────────────────────────────────────────────────────────────
@@ -535,3 +536,5 @@ $ipJobs | Remove-Job -Force -ErrorAction SilentlyContinue
 Write-Host "`nScan completed." -ForegroundColor Green
 Write-Host "Results saved to: $outputCsvFile"
 Write-Host "Database:         $dbPath"
+$elapsed = (Get-Date) - $scanStart
+Write-Host "Time taken:       $('{0:D2}h {1:D2}m {2:D2}s' -f $elapsed.Hours, $elapsed.Minutes, $elapsed.Seconds)"
