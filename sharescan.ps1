@@ -322,21 +322,20 @@ foreach ($server in $servers) {
                 # Log and count here — before the job is queued — so these always fire
                 # regardless of whether the job slot is available or the job ever starts.
                 $syncProgress.LogQueue.Enqueue(@{ Msg = "    Queuing $($foundfile.FullName)..."; Color = "Cyan" })
-                $fileCounter.AddOrUpdate($fileKey, 1, [Func[string, int, int]]{ param($k, $v) $v + 1 }) | Out-Null
-
-                $fileJobs += Start-ThreadJob -ThrottleLimit 4 -ArgumentList $foundfile, $server, $share, $timestamp, $fileKey, $lock, $keywords, $fileExtensions, $outputCsvFile, $dbPath, $tableName -ScriptBlock {
+                $fileJobs += Start-ThreadJob -ThrottleLimit 4 -ArgumentList $foundfile, $server, $share, $timestamp, $fileKey, $fileCounter, $lock, $keywords, $fileExtensions, $outputCsvFile, $dbPath, $tableName -ScriptBlock {
 
                     $file           = $args[0]
                     $server         = $args[1]
                     $share          = $args[2]
                     $timestamp      = $args[3]
                     $fileKey        = $args[4]
-                    $lock           = $args[5]
-                    $keywords       = $args[6]
-                    $fileExtensions = $args[7]
-                    $outputCsvFile  = $args[8]
-                    $dbPath         = $args[9]
-                    $tableName      = $args[10]
+                    $fileCounter    = $args[5]   # ConcurrentDictionary[string,int] — survives serialization
+                    $lock           = $args[6]
+                    $keywords       = $args[7]
+                    $fileExtensions = $args[8]
+                    $outputCsvFile  = $args[9]
+                    $dbPath         = $args[10]
+                    $tableName      = $args[11]
 
                     try {
                         # ── 1. Filename keyword scan ──────────────────────────
@@ -407,7 +406,7 @@ foreach ($server in $servers) {
                         } finally { [System.Threading.Monitor]::Exit($lock) }
                     }
 
-
+                    $fileCounter.AddOrUpdate($fileKey, 1, [Func[string, int, int]]{ param($k, $v) $v + 1 }) | Out-Null
                 }
             }
 
