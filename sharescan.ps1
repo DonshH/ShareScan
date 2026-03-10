@@ -318,24 +318,25 @@ foreach ($server in $servers) {
             $fileJobs = @()
 
             foreach ($foundfile in $tempAllPaths) {
-                $fileJobs += Start-ThreadJob -ThrottleLimit 4 -ArgumentList $foundfile, $server, $share, $timestamp, $fileKey, $fileCounter, $syncProgress.LogQueue, $lock, $keywords, $fileExtensions, $outputCsvFile, $dbPath, $tableName -ScriptBlock {
+                # Log and count here — before the job is queued — so these always fire
+                # regardless of whether the job slot is available or the job ever starts.
+                $syncProgress.LogQueue.Enqueue(@{ Msg = "    Queuing $($foundfile.FullName)..."; Color = "Cyan" })
+                $fileCounter.AddOrUpdate($fileKey, 1, [Func[string, int, int]]{ param($k, $v) $v + 1 }) | Out-Null
+
+                $fileJobs += Start-ThreadJob -ThrottleLimit 4 -ArgumentList $foundfile, $server, $share, $timestamp, $fileKey, $lock, $keywords, $fileExtensions, $outputCsvFile, $dbPath, $tableName -ScriptBlock {
 
                     $file           = $args[0]
                     $server         = $args[1]
                     $share          = $args[2]
                     $timestamp      = $args[3]
                     $fileKey        = $args[4]
-                    $fileCounter    = $args[5]   # ConcurrentDictionary[string,int] — survives serialization
-                    $logQueue       = $args[6]   # ConcurrentQueue — survives serialization, enqueues reach main thread
-                    $lock           = $args[7]
-                    $keywords       = $args[8]
-                    $fileExtensions = $args[9]
-                    $outputCsvFile  = $args[10]
-                    $dbPath         = $args[11]
-                    $tableName      = $args[12]
+                    $lock           = $args[5]
+                    $keywords       = $args[6]
+                    $fileExtensions = $args[7]
+                    $outputCsvFile  = $args[8]
+                    $dbPath         = $args[9]
+                    $tableName      = $args[10]
 
-                    $logQueue.Enqueue(@{ Msg = "    Scanning $($file.FullName)..."; Color = "Cyan" })
-                    $fileCounter.AddOrUpdate($fileKey, 1, [Func[string, int, int]]{ param($k, $v) $v + 1 }) | Out-Null
                     try {
                         # ── 1. Filename keyword scan ──────────────────────────
                         $nameMatches = @($keywords.Where{ $file.FullName -match [regex]::Escape($_) })
@@ -409,8 +410,14 @@ foreach ($server in $servers) {
                 }
             }
 
-            # Wait for all file jobs in this share
-            $fileJobs | Wait-Job | Remove-Job -Force
+            # Wait for all file jobs, logging any that are still running every 30s so hangs are visible
+            $fileJobTimeout = 30  # seconds between "still waiting" log messages
+            while ($fileJobs | Where-Object { $_.State -in 'Running','NotStarted' }) {
+                $stillRunning = $fileJobs | Where-Object { $_.State -in 'Running','NotStarted' }
+                $syncProgress.LogQueue.Enqueue(@{ Msg = "    Still waiting on $($stillRunning.Count) file job(s) in $share..."; Color = "Yellow" })
+                $fileJobs | Wait-Job -Timeout $fileJobTimeout | Out-Null
+            }
+            $fileJobs | Remove-Job -Force
 
             # Report enumeration errors
             foreach ($prob in $problems) {
@@ -470,7 +477,7 @@ if (-not $runningFound) {
 $parentId = 10
 
 try {
-    while ($ipJobs | Where-Object { $_.State -eq 'Running' }) {
+    while ($ipJobs | Where-Object { $_.State -in 'Running','NotStarted' }) {
         # ── Flush log queue ────────────────────────────────────────
         $logItem = $null
         while ($syncProgress.LogQueue.TryDequeue([ref]$logItem)) {
