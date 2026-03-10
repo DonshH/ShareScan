@@ -134,11 +134,11 @@ $ipJobs = @()
 # ────────────────────────────────────────────────────────────────
 
 foreach ($server in $servers) {
-    $ipJobs += Start-ThreadJob -ThrottleLimit $throttle -ArgumentList $server, $fileCounter, $fileProgress -ScriptBlock {
+    $ipJobs += Start-ThreadJob -ThrottleLimit $throttle -ArgumentList $server, $fileCounter -ScriptBlock {
 
         $server          = $args[0]
         $fileCounter     = $args[1]   # ConcurrentDictionary[string,int] — atomic int counter, survives serialization
-        $fileProgress    = $args[2]   # ConcurrentDictionary[string,hashtable] — safe for cross-thread key enumeration
+        $fileProgress    = $using:fileProgress  # written by IP job only — $using: preserves live reference
         $syncProgress    = $using:syncProgress
         $keywords        = $using:keywords
         $fileExtensions  = $using:fileExtensions
@@ -147,10 +147,8 @@ foreach ($server in $servers) {
         $tableName       = $using:tableName
         $lock            = $using:lock
 
-        # Update IP progress now that this job is actually running
-        $syncProgress.IPs.Current++
-        $syncProgress.IPs.Status = "Processing $server ($($syncProgress.IPs.Current)/$($syncProgress.IPs.Total))"
-        $syncProgress.CurrentIP  = $server
+        # CurrentIP updated here so the share bar knows which IP is active
+        $syncProgress.CurrentIP = $server
     # ────────────────────────────────────────────────────────────────
     #   FUNCTION: Enumerate files (with batch parallel processing)
     # ────────────────────────────────────────────────────────────────
@@ -468,6 +466,8 @@ foreach ($server in $servers) {
 
         # Clear share progress after IP is done
         $syncProgress.Shares.Remove($server)
+        $syncProgress.IPs.Current++
+        $syncProgress.IPs.Status = "$server completed ($($syncProgress.IPs.Current)/$($syncProgress.IPs.Total))"
         $syncProgress.LogQueue.Enqueue(@{ Msg = "$server completed"; Color = "Green" })
     }
 }
