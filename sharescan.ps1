@@ -121,7 +121,13 @@ $fileProgress = [System.Collections.Concurrent.ConcurrentDictionary[string, hash
 # int values are safe: AddOrUpdate on an int is truly atomic across thread boundaries.
 $fileCounter = [System.Collections.Concurrent.ConcurrentDictionary[string, int]]::new()
 
-$lock = [System.Object]::new()
+
+# ── Writer queue ─────────────────────────────────────────────────
+# All CSV lines and DB INSERTs are enqueued here as @{Line=; Insert=}
+# and written by a single dedicated thread — no concurrent file I/O,
+# no Monitor locks, no orphaned sqlite3 processes.
+$writeQueue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
+$dbDone     = [System.Collections.Hashtable]::Synchronized(@{ Value = $false })
 
 $servers = Get-Content $serverList -ErrorAction Stop
 $syncProgress.IPs.Total = $servers.Count
@@ -129,16 +135,39 @@ $syncProgress.IPs.Total = $servers.Count
 $ipJobs = @()
 $scanStart = Get-Date
 
+# ────────────────────────────────────────────────────────────────
+#   WRITER JOB — single thread, owns CSV and sqlite3 exclusively
+# ────────────────────────────────────────────────────────────────
+$dbWriterJob = Start-ThreadJob -ArgumentList $writeQueue, $dbDone, $dbPath, $outputCsvFile -ScriptBlock {
+    $writeQueue    = $args[0]
+    $dbDone        = $args[1]
+    $dbPath        = $args[2]
+    $outputCsvFile = $args[3]
+
+    "PRAGMA journal_mode=WAL;" | sqlite3 $dbPath
+
+    $item = $null
+    while (-not $dbDone.Value -or -not $writeQueue.IsEmpty) {
+        if ($writeQueue.TryDequeue([ref]$item)) {
+            if ($item.Line)   { $item.Line   | Out-File $outputCsvFile -Append -Encoding utf8 }
+            if ($item.Insert) { $item.Insert | sqlite3 $dbPath }
+        } else {
+            Start-Sleep -Milliseconds 50
+        }
+    }
+}
+
 
 # ────────────────────────────────────────────────────────────────
 #   MAIN LOOP - Launch one thread job per IP
 # ────────────────────────────────────────────────────────────────
 
 foreach ($server in $servers) {
-    $ipJobs += Start-ThreadJob -ThrottleLimit $throttle -ArgumentList $server, $fileCounter -ScriptBlock {
+    $ipJobs += Start-ThreadJob -ThrottleLimit $throttle -ArgumentList $server, $fileCounter, $writeQueue -ScriptBlock {
 
         $server          = $args[0]
         $fileCounter     = $args[1]   # ConcurrentDictionary[string,int] — atomic int counter, survives serialization
+        $writeQueue      = $args[2]   # ConcurrentQueue[object] — enqueue @{Line=;Insert=} for the dedicated writer
         $fileProgress    = $using:fileProgress  # written by IP job only — $using: preserves live reference
         $syncProgress    = $using:syncProgress
         $keywords        = $using:keywords
@@ -146,7 +175,6 @@ foreach ($server in $servers) {
         $outputCsvFile   = $using:outputCsvFile
         $dbPath          = $using:dbPath
         $tableName       = $using:tableName
-        $lock            = $using:lock
 
     # ────────────────────────────────────────────────────────────────
     #   FUNCTION: Enumerate files (with batch parallel processing)
@@ -322,7 +350,7 @@ foreach ($server in $servers) {
                 # Log and count here — before the job is queued — so these always fire
                 # regardless of whether the job slot is available or the job ever starts.
                 $syncProgress.LogQueue.Enqueue(@{ Msg = "    Queuing $($foundfile.FullName)..."; Color = "Cyan" })
-                $fileJobs += Start-ThreadJob -ThrottleLimit 4 -ArgumentList $foundfile, $server, $share, $timestamp, $fileKey, $fileCounter, $lock, $keywords, $fileExtensions, $outputCsvFile, $dbPath, $tableName -ScriptBlock {
+                $fileJobs += Start-ThreadJob -ThrottleLimit 4 -ArgumentList $foundfile, $server, $share, $timestamp, $fileKey, $fileCounter, $writeQueue, $keywords, $fileExtensions, $dbPath, $tableName -ScriptBlock {
 
                     $file           = $args[0]
                     $server         = $args[1]
@@ -330,12 +358,11 @@ foreach ($server in $servers) {
                     $timestamp      = $args[3]
                     $fileKey        = $args[4]
                     $fileCounter    = $args[5]   # ConcurrentDictionary[string,int] — survives serialization
-                    $lock           = $args[6]
+                    $writeQueue     = $args[6]   # ConcurrentQueue[object] — enqueue @{Line=;Insert=} for dedicated writer
                     $keywords       = $args[7]
                     $fileExtensions = $args[8]
-                    $outputCsvFile  = $args[9]
-                    $dbPath         = $args[10]
-                    $tableName      = $args[11]
+                    $dbPath         = $args[9]
+                    $tableName      = $args[10]
 
                     try {
                         # ── 1. Filename keyword scan ──────────────────────────
@@ -344,36 +371,27 @@ foreach ($server in $servers) {
                             $acl = try { Get-Acl $file.FullName } catch { $null }
                             $perms = if ($acl) { ($acl.Access | ForEach-Object { "$($_.IdentityReference):$($_.FileSystemRights)" }) -join "; " } else { "Error: permissions" }
                             $foundStr = $nameMatches -join ","
-                            $line = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),""$perms"",""$foundStr"",Keyword in filename"
-                            $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','$($perms -replace "'","''")','$($foundStr -replace "'","''")','Keyword in filename');"
-                            [System.Threading.Monitor]::Enter($lock)
-                            try {
-                                $line | Out-File $outputCsvFile -Append -Encoding utf8
-                                $insert | sqlite3 $dbPath
-                            } finally { [System.Threading.Monitor]::Exit($lock) }
+                            $writeQueue.Enqueue(@{
+                                Line   = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),""$perms"",""$foundStr"",Keyword in filename"
+                                Insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','$($perms -replace "'","''")','$($foundStr -replace "'","''")','Keyword in filename');"
+                            })
                         }
 
                         # ── 2. Extension check — skip if unsupported ───────────
                         if ($fileExtensions -notcontains $file.Extension) {
-                            $line = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),,,'Skipped: unsupported extension'"
-                            $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','','','Skipped: unsupported extension');"
-                            [System.Threading.Monitor]::Enter($lock)
-                            try {
-                                $line | Out-File $outputCsvFile -Append -Encoding utf8
-                                $insert | sqlite3 $dbPath
-                            } finally { [System.Threading.Monitor]::Exit($lock) }
+                            $writeQueue.Enqueue(@{
+                                Line   = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),,,'Skipped: unsupported extension'"
+                                Insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','','','Skipped: unsupported extension');"
+                            })
                             return
                         }
 
                         # ── 3. Size check — skip if > 1GB ─────────────────────
                         if ($file.Length -gt 1GB) {
-                            $line = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),,,'Skipped: file > 1GB'"
-                            $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','','','Skipped: file > 1GB');"
-                            [System.Threading.Monitor]::Enter($lock)
-                            try {
-                                $line | Out-File $outputCsvFile -Append -Encoding utf8
-                                $insert | sqlite3 $dbPath
-                            } finally { [System.Threading.Monitor]::Exit($lock) }
+                            $writeQueue.Enqueue(@{
+                                Line   = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),,,'Skipped: file > 1GB'"
+                                Insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','','','Skipped: file > 1GB');"
+                            })
                             return
                         }
 
@@ -384,38 +402,46 @@ foreach ($server in $servers) {
                             $acl = try { Get-Acl $file.FullName } catch { $null }
                             $perms = if ($acl) { ($acl.Access | ForEach-Object { "$($_.IdentityReference):$($_.FileSystemRights)" }) -join "; " } else { "Error: permissions" }
                             $foundStr = $contentMatches -join ","
-                            $line = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),""$perms"",""$foundStr"","
-                            $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','$($perms -replace "'","''")','$($foundStr -replace "'","''")','');"
-                            [System.Threading.Monitor]::Enter($lock)
-                            try {
-                                $line | Out-File $outputCsvFile -Append -Encoding utf8
-                                $insert | sqlite3 $dbPath
-                            } finally { [System.Threading.Monitor]::Exit($lock) }
+                            $writeQueue.Enqueue(@{
+                                Line   = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),""$perms"",""$foundStr"","
+                                Insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','$($perms -replace "'","''")','$($foundStr -replace "'","''")','');"
+                            })
                         }
                     }
                     catch {
-                        $errPath  = $file.FullName -replace "'", "''"
-                        $errMsg   = $_.Exception.Message -replace "'", "''"
-                        $line = "$server,$share,,`'$errPath`',,$timestamp,,,,$errMsg"
-                        $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','','$errPath','','$timestamp','','','','Error on Accessing');"
-
-                        [System.Threading.Monitor]::Enter($lock)
-                        try {
-                            $line | Out-File $outputCsvFile -Append -Encoding utf8
-                            $insert | sqlite3 $dbPath
-                        } finally { [System.Threading.Monitor]::Exit($lock) }
+                        $errPath = $file.FullName -replace "'", "''"
+                        $errMsg  = $_.Exception.Message -replace "'", "''"
+                        $writeQueue.Enqueue(@{
+                            Line   = "$server,$share,,`'$errPath`',,$timestamp,,,,$errMsg"
+                            Insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','','$errPath','','$timestamp','','','','Error on Accessing');"
+                        })
                     }
 
                     $fileCounter.AddOrUpdate($fileKey, 1, [Func[string, int, int]]{ param($k, $v) $v + 1 }) | Out-Null
                 }
             }
 
-            # Wait for all file jobs, logging any that are still running every 30s so hangs are visible
-            $fileJobTimeout = 30  # seconds between "still waiting" log messages
+            # Wait for file jobs with a hard per-job timeout.
+            # Track when each job was launched so we can kill any that exceed the limit.
+            $fileJobStartTimes = @{}
+            foreach ($j in $fileJobs) { $fileJobStartTimes[$j.Id] = (Get-Date) }
+            $fileJobHardTimeout = 120  # seconds before a hung file job is force-killed
+
             while ($fileJobs | Where-Object { $_.State -in 'Running','NotStarted' }) {
-                $stillRunning = $fileJobs | Where-Object { $_.State -in 'Running','NotStarted' }
-                $syncProgress.LogQueue.Enqueue(@{ Msg = "    Still waiting on $($stillRunning.Count) file job(s) in $share..."; Color = "Yellow" })
-                $fileJobs | Wait-Job -Timeout $fileJobTimeout | Out-Null
+                $fileJobs | Wait-Job -Timeout 10 | Out-Null
+
+                $now = Get-Date
+                foreach ($j in ($fileJobs | Where-Object { $_.State -in 'Running','NotStarted' })) {
+                    $elapsed = ($now - $fileJobStartTimes[$j.Id]).TotalSeconds
+                    if ($elapsed -gt $fileJobHardTimeout) {
+                        $syncProgress.LogQueue.Enqueue(@{ Msg = "    WARNING: File job $($j.Id) exceeded ${fileJobHardTimeout}s timeout — force stopping"; Color = "Red" })
+                        $j | Stop-Job
+                        $writeQueue.Enqueue(@{
+                            Line   = "$server,$share,,,'','$timestamp',,,,'Timeout: file job exceeded ${fileJobHardTimeout}s'"
+                            Insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','','','','$timestamp','','','','Timeout: file job exceeded ${fileJobHardTimeout}s');"
+                        })
+                    }
+                }
             }
             $fileJobs | Remove-Job -Force
 
@@ -423,14 +449,10 @@ foreach ($server in $servers) {
             foreach ($prob in $problems) {
                 $errPath = $prob.TargetObject -replace "'", "''"
                 $errMsg  = $prob.Message -replace "'", "''"
-                $line = "$server,$share,,`'$errPath`',,$timestamp,,,,$errMsg"
-                $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','','$errPath','','$timestamp','','','','$errMsg');"
-
-                [System.Threading.Monitor]::Enter($lock)
-                try {
-                    $line | Out-File $outputCsvFile -Append -Encoding utf8
-                    $insert | sqlite3 $dbPath
-                } finally { [System.Threading.Monitor]::Exit($lock) }
+                $writeQueue.Enqueue(@{
+                    Line   = "$server,$share,,`'$errPath`',,$timestamp,,,,$errMsg"
+                    Insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','','$errPath','','$timestamp','','','','$errMsg');"
+                })
             }
 
             # Clear file progress after share is done
@@ -537,6 +559,10 @@ while ($syncProgress.LogQueue.TryDequeue([ref]$logItem)) {
     else                { Write-Host $logItem.Msg }
 }
 $ipJobs | Remove-Job -Force -ErrorAction SilentlyContinue
+
+# Signal the DB writer that no more inserts are coming, then wait for it to drain
+$dbDone.Value = $true
+$dbWriterJob | Wait-Job | Remove-Job -Force
 
 Write-Host "`nScan completed." -ForegroundColor Green
 Write-Host "Results saved to: $outputCsvFile"
