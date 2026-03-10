@@ -335,72 +335,11 @@ foreach ($server in $servers) {
 
                     $syncProgress.LogQueue.Enqueue(@{ Msg = "    Scanning $($file.FullName)..."; Color = "Cyan" })
                     try {
-                        # ── Collect all filename keyword matches (no early exit) ──
+                        # ── 1. Filename keyword scan ──────────────────────────
                         $nameMatches = @($keywords.Where{ $file.FullName -match [regex]::Escape($_) })
-
-                        # ── Skip unsupported extensions ────────────────────────
-                        # If filename matched, still record it — just skip content scan.
-                        if ($fileExtensions -notcontains $file.Extension) {
-                            if ($nameMatches.Count -gt 0) {
-                                $acl = try { Get-Acl $file.FullName } catch { $null }
-                                $perms = if ($acl) { ($acl.Access | ForEach-Object { "$($_.IdentityReference):$($_.FileSystemRights)" }) -join "; " } else { "Error: permissions" }
-                                $foundStr = $nameMatches -join ","
-                                $line = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),""$perms"",""$foundStr"",Keyword in filename"
-                                $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','$($perms -replace "'","''")','$($foundStr -replace "'","''")','Keyword in filename');"
-                                [System.Threading.Monitor]::Enter($lock)
-                                try {
-                                    $line | Out-File $outputCsvFile -Append -Encoding utf8
-                                    $insert | sqlite3 $dbPath
-                                } finally { [System.Threading.Monitor]::Exit($lock) }
-                            } else {
-                                $line = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),,,'Skipped: unsupported extension'"
-                                $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','','','Skipped: unsupported extension');"
-                                [System.Threading.Monitor]::Enter($lock)
-                                try {
-                                    $line | Out-File $outputCsvFile -Append -Encoding utf8
-                                    $insert | sqlite3 $dbPath
-                                } finally { [System.Threading.Monitor]::Exit($lock) }
-                            }
-                            return
-                        }
-
-                        # ── Skip very large files ──────────────────────────────
-                        if ($file.Length -gt 1GB) {
-                            if ($nameMatches.Count -gt 0) {
-                                $acl = try { Get-Acl $file.FullName } catch { $null }
-                                $perms = if ($acl) { ($acl.Access | ForEach-Object { "$($_.IdentityReference):$($_.FileSystemRights)" }) -join "; " } else { "Error: permissions" }
-                                $foundStr = $nameMatches -join ","
-                                $line = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),""$perms"",""$foundStr"",Keyword in filename - file > 1GB not content scanned"
-                                $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','$($perms -replace "'","''")','$($foundStr -replace "'","''")','Keyword in filename - file > 1GB not content scanned');"
-                                [System.Threading.Monitor]::Enter($lock)
-                                try {
-                                    $line | Out-File $outputCsvFile -Append -Encoding utf8
-                                    $insert | sqlite3 $dbPath
-                                } finally { [System.Threading.Monitor]::Exit($lock) }
-                            } else {
-                                $line = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),,,'Skipped: file > 1GB'"
-                                $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','','','Skipped: file > 1GB');"
-                                [System.Threading.Monitor]::Enter($lock)
-                                try {
-                                    $line | Out-File $outputCsvFile -Append -Encoding utf8
-                                    $insert | sqlite3 $dbPath
-                                } finally { [System.Threading.Monitor]::Exit($lock) }
-                            }
-                            return
-                        }
-
-                        # ── Read content and search ────────────────────────────
-                        $content = Get-Content $file.FullName -Raw -ErrorAction Stop
-                        $contentMatches = @($keywords.Where{ $content -match [regex]::Escape($_) })
-
-                        # ACL fetched once if either match type fires
-                        if ($nameMatches.Count -gt 0 -or $contentMatches.Count -gt 0) {
+                        if ($nameMatches.Count -gt 0) {
                             $acl = try { Get-Acl $file.FullName } catch { $null }
                             $perms = if ($acl) { ($acl.Access | ForEach-Object { "$($_.IdentityReference):$($_.FileSystemRights)" }) -join "; " } else { "Error: permissions" }
-                        }
-
-                        # ── Row 1: filename match ──────────────────────────────
-                        if ($nameMatches.Count -gt 0) {
                             $foundStr = $nameMatches -join ","
                             $line = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),""$perms"",""$foundStr"",Keyword in filename"
                             $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','$($perms -replace "'","''")','$($foundStr -replace "'","''")','Keyword in filename');"
@@ -411,8 +350,36 @@ foreach ($server in $servers) {
                             } finally { [System.Threading.Monitor]::Exit($lock) }
                         }
 
-                        # ── Row 2: content match ───────────────────────────────
+                        # ── 2. Extension check — skip if unsupported ───────────
+                        if ($fileExtensions -notcontains $file.Extension) {
+                            $line = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),,,'Skipped: unsupported extension'"
+                            $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','','','Skipped: unsupported extension');"
+                            [System.Threading.Monitor]::Enter($lock)
+                            try {
+                                $line | Out-File $outputCsvFile -Append -Encoding utf8
+                                $insert | sqlite3 $dbPath
+                            } finally { [System.Threading.Monitor]::Exit($lock) }
+                            return
+                        }
+
+                        # ── 3. Size check — skip if > 1GB ─────────────────────
+                        if ($file.Length -gt 1GB) {
+                            $line = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),,,'Skipped: file > 1GB'"
+                            $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','','','Skipped: file > 1GB');"
+                            [System.Threading.Monitor]::Enter($lock)
+                            try {
+                                $line | Out-File $outputCsvFile -Append -Encoding utf8
+                                $insert | sqlite3 $dbPath
+                            } finally { [System.Threading.Monitor]::Exit($lock) }
+                            return
+                        }
+
+                        # ── 4. Content keyword scan ────────────────────────────
+                        $content = Get-Content $file.FullName -Raw -ErrorAction Stop
+                        $contentMatches = @($keywords.Where{ $content -match [regex]::Escape($_) })
                         if ($contentMatches.Count -gt 0) {
+                            $acl = try { Get-Acl $file.FullName } catch { $null }
+                            $perms = if ($acl) { ($acl.Access | ForEach-Object { "$($_.IdentityReference):$($_.FileSystemRights)" }) -join "; " } else { "Error: permissions" }
                             $foundStr = $contentMatches -join ","
                             $line = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),""$perms"",""$foundStr"","
                             $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','$($perms -replace "'","''")','$($foundStr -replace "'","''")','');"
