@@ -290,6 +290,7 @@ foreach ($server in $servers) {
 
 
         $syncProgress.CurrentIP = $server
+        $syncProgress.IPs.Status = "Scanning $server..."
         $syncProgress.LogQueue.Enqueue(@{ Msg = "Scanning $server ..."; Color = "Cyan" })
 
         $shares = Get-ShareNames $server
@@ -440,7 +441,6 @@ foreach ($server in $servers) {
 
         $syncProgress.Shares.Remove($server)
         $syncProgress.IPs.Current++
-        $syncProgress.IPs.Status = "$server completed ($($syncProgress.IPs.Current)/$($syncProgress.IPs.Total))"
         $syncProgress.LogQueue.Enqueue(@{ Msg = "$server completed"; Color = "Green" })
     }
 }
@@ -489,7 +489,7 @@ try {
         $ip = $syncProgress.IPs
         Write-Progress -Id $parentId `
                        -Activity "Scanning Network Shares" `
-                       -Status "IP $($ip.Current)/$($ip.Total) - $($ip.Status)" `
+                       -Status "IP ($($ip.Current)/$($ip.Total)) $($ip.Status)" `
                        -PercentComplete ([math]::Round(($ip.Current / $ip.Total)*100, 1))
 
         # Bar 2: Shares
