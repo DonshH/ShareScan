@@ -110,13 +110,14 @@ $syncProgress = [System.Collections.Hashtable]::Synchronized(@{
     IPs      = @{ Current = 0; Total = 0; Status = "Initializing..." }
     CurrentIP = ""
     Shares   = @{}   # server → @{Current=; Total=; Status=}
-    Files    = @{}   # "server\share" → @{Total=; FileName=""}
+    Files    = @{}   # "server\share" → @{Total=; FileName=""}  (written only by IP job via $using:)
     LogQueue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
 })
 
-# Separate concurrent dictionary for file counters — survives thread-job serialization
-# and supports atomic increments from nested thread jobs.
-$fileCounters = [System.Collections.Concurrent.ConcurrentDictionary[string,int]]::new()
+# Atomic file counter — ConcurrentDictionary[string,int] passed via -ArgumentList to nested jobs.
+# int is a value type: AddOrUpdate on it is truly atomic and survives the serialization boundary.
+# Kept separate from syncProgress.Files because syncProgress itself cannot be passed via -ArgumentList.
+$fileCounter = [System.Collections.Concurrent.ConcurrentDictionary[string, int]]::new()
 
 $lock = [System.Object]::new()
 
@@ -131,14 +132,10 @@ $ipJobs = @()
 # ────────────────────────────────────────────────────────────────
 
 foreach ($server in $servers) {
-    $syncProgress.IPs.Current++
-    $syncProgress.IPs.Status = "Processing $server ($($syncProgress.IPs.Current)/$($syncProgress.IPs.Total))"
-    $syncProgress.CurrentIP = $server
-    Start-Sleep -Milliseconds 800
-    $ipJobs += Start-ThreadJob -ThrottleLimit $throttle -ArgumentList $server, $fileCounters -ScriptBlock {
+    $ipJobs += Start-ThreadJob -ThrottleLimit $throttle -ArgumentList $server, $fileCounter -ScriptBlock {
 
         $server          = $args[0]
-        $fileCounters    = $args[1]   # ConcurrentDictionary — survives serialization, atomically incrementable
+        $fileCounter     = $args[1]   # ConcurrentDictionary[string,int] — atomic int counter, survives serialization
         $syncProgress    = $using:syncProgress
         $keywords        = $using:keywords
         $fileExtensions  = $using:fileExtensions
@@ -146,6 +143,11 @@ foreach ($server in $servers) {
         $dbPath          = $using:dbPath
         $tableName       = $using:tableName
         $lock            = $using:lock
+
+        # Update IP progress now that this job is actually running
+        [System.Threading.Interlocked]::Increment([ref]$syncProgress.IPs.Current) | Out-Null
+        $syncProgress.IPs.Status = "Processing $server ($($syncProgress.IPs.Current)/$($syncProgress.IPs.Total))"
+        $syncProgress.CurrentIP  = $server
     # ────────────────────────────────────────────────────────────────
     #   FUNCTION: Enumerate files (with batch parallel processing)
     # ────────────────────────────────────────────────────────────────
@@ -308,24 +310,20 @@ foreach ($server in $servers) {
             $tempAllPaths = Get-AllFiles -RootPath $searchPath -ErrorList ([ref]$problems)
 
             $syncProgress.LogQueue.Enqueue(@{ Msg = "    $($tempAllPaths.Count) files found in $share"; Color = $null })
-            $syncProgress.Files[$fileKey] = @{
-                Total     = $tempAllPaths.Count
-                FileName  = ""
-            }
-            # Initialise / reset the atomic counter for this share
-            $fileCounters[$fileKey] = 0
+            $syncProgress.Files[$fileKey] = @{ Total = $tempAllPaths.Count; FileName = "" }
+            $fileCounter[$fileKey] = 0
 
             $fileJobs = @()
 
             foreach ($foundfile in $tempAllPaths) {
-                $fileJobs += Start-ThreadJob -ThrottleLimit 4 -ArgumentList $foundfile, $server, $share, $timestamp, $fileKey, $fileCounters, $syncProgress, $lock, $keywords, $fileExtensions, $outputCsvFile, $dbPath, $tableName -ScriptBlock {
+                $fileJobs += Start-ThreadJob -ThrottleLimit 4 -ArgumentList $foundfile, $server, $share, $timestamp, $fileKey, $fileCounter, $syncProgress, $lock, $keywords, $fileExtensions, $outputCsvFile, $dbPath, $tableName -ScriptBlock {
 
                     $file           = $args[0]
                     $server         = $args[1]
                     $share          = $args[2]
                     $timestamp      = $args[3]
                     $fileKey        = $args[4]
-                    $fileCounters   = $args[5]   # ConcurrentDictionary for atomic file count
+                    $fileCounter    = $args[5]   # ConcurrentDictionary[string,int] — atomic int, survives serialization
                     $syncProgress   = $args[6]
                     $lock           = $args[7]
                     $keywords       = $args[8]
@@ -412,10 +410,9 @@ foreach ($server in $servers) {
                         } finally { [System.Threading.Monitor]::Exit($lock) }
                     }
 
-                    # ── Update file progress atomically ───────────────────────
-                    # AddOrUpdate with +1 delta is the ConcurrentDictionary atomic increment pattern.
-                    $fileCounters.AddOrUpdate($fileKey, 1, [Func[string,int,int]]{ param($k,$v) $v + 1 }) | Out-Null
-                    $syncProgress.Files[$fileKey].FileName = $file.Name
+                    # ── Update file progress ──────────────────────────────────
+                    # fileCounter holds int values — AddOrUpdate on int is truly atomic across thread boundaries.
+                    $fileCounter.AddOrUpdate($fileKey, 1, [Func[string, int, int]]{ param($k, $v) $v + 1 }) | Out-Null
                 }
             }
 
@@ -438,7 +435,7 @@ foreach ($server in $servers) {
 
             # Clear file progress after share is done
             $syncProgress.Files.Remove($fileKey)
-            $null = $fileCounters.TryRemove($fileKey, [ref]$null)
+            $null = $fileCounter.TryRemove($fileKey, [ref]$null)
         }
 
         # Clear share progress after IP is done
@@ -513,8 +510,8 @@ try {
             $f = $syncProgress.Files[$activeKey]
             $shareName = $activeKey.Split('\')[1]
             $currentCount = 0
-            $fileCounters.TryGetValue($activeKey, [ref]$currentCount) | Out-Null
-            $pct = [math]::Round(($currentCount / $f.Total) * 100, 1)
+            $fileCounter.TryGetValue($activeKey, [ref]$currentCount) | Out-Null
+            $pct = if ($f.Total -gt 0) { [math]::Round(($currentCount / $f.Total) * 100, 1) } else { 0 }
             Write-Progress -Id ($parentId + 2) `
                            -ParentId ($parentId + 1) `
                            -Activity "Files in $shareName" `
