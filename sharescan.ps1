@@ -119,7 +119,7 @@ function Get-AllFiles {
         [ref]$ErrorList
     )
 
-    $roboOutput = robocopy $RootPath NULL /L /S /NFL /NDL /NJH /NJS /NC /FP /NS /MT:128 2>&1
+    $roboOutput = robocopy $RootPath NULL /L /S /NDL /NJH /NJS /NC /NP /FP /NS /MT:128 2>&1
 
     foreach ($line in $roboOutput) {
         $trimmed = $line.Trim()
@@ -231,6 +231,7 @@ foreach ($server in $servers) {
         $fileJobs = @()
 
         foreach ($foundfile in $tempAllPaths) {
+            Write-Host "Scanning $($foundfile.FullName) ..." -ForegroundColor Cyan
             $fileJobs += Start-ThreadJob -ThrottleLimit $throttle -ArgumentList $foundfile, $server, $share, $timestamp, $fileKey, $lock, $keywords, $fileExtensions, $outputCsvFile, $dbPath, $tableName -ScriptBlock {
 
                 $file           = $args[0]
@@ -246,7 +247,6 @@ foreach ($server in $servers) {
                 $tableName      = $args[10]
 
                 try {
-                    Write-Host "Scanning $($file.FullName)"
                     # ── 1. Filename keyword scan ──────────────────────────
                     $nameMatches = @($keywords.Where{ $file.FullName -match [regex]::Escape($_) })
                     if ($nameMatches.Count -gt 0) {
