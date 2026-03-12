@@ -121,25 +121,20 @@ function Get-AllFiles {
 
     $roboOutput = robocopy $RootPath NULL /L /S /NDL /NJH /NJS /NC /NP /FP /NS /MT:128 2>&1
 
-    foreach ($line in $roboOutput) {
-        $trimmed = $line.Trim()
+    $results = $roboOutput | ForEach-Object -Parallel {
+        $trimmed = $_.Trim()
 
-        # Skip empty lines
-        if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
+        if ([string]::IsNullOrWhiteSpace($trimmed)) { return }
 
-        # Catch access denied errors
         if ($trimmed -match 'Access is denied|ERROR') {
-            if ($null -ne $ErrorList) {
-                $ErrorList.Value += @{
-                    TargetObject = $trimmed
-                    Exception    = $null
-                    Message      = "Error on Accessing"
-                }
-            }
-            continue
+            [PSCustomObject]@{__IsError = $true; Data = @{
+                TargetObject = $trimmed
+                Exception    = $null
+                Message      = "Error on Accessing"
+            }}
+            return
         }
 
-        # Each line is a full file path
         try {
             $f = [System.IO.FileInfo]::new($trimmed)
             [PSCustomObject]@{
@@ -150,13 +145,19 @@ function Get-AllFiles {
                 CreationTime = $f.CreationTime
             }
         } catch {
-            if ($null -ne $ErrorList) {
-                $ErrorList.Value += @{
-                    TargetObject = $trimmed
-                    Exception    = $_.Exception
-                    Message      = "Error on Accessing"
-                }
-            }
+            [PSCustomObject]@{__IsError = $true; Data = @{
+                TargetObject = $trimmed
+                Exception    = $_.Exception
+                Message      = "Error on Accessing"
+            }}
+        }
+    } -ThrottleLimit 16
+
+    foreach ($item in $results) {
+        if ($item -is [PSObject] -and $item.PSObject.Properties['__IsError']) {
+            if ($null -ne $ErrorList) { $ErrorList.Value += $item.Data }
+        } else {
+            $item
         }
     }
 }
@@ -231,7 +232,7 @@ foreach ($server in $servers) {
         $fileJobs = @()
 
         foreach ($foundfile in $tempAllPaths) {
-            Write-Host "Scanning $($foundfile.FullName) ..." -ForegroundColor Cyan
+            Write-Host "   Scanning $($foundfile.FullName) ..." -ForegroundColor Cyan
             $fileJobs += Start-ThreadJob -ThrottleLimit $throttle -ArgumentList $foundfile, $server, $share, $timestamp, $fileKey, $lock, $keywords, $fileExtensions, $outputCsvFile, $dbPath, $tableName -ScriptBlock {
 
                 $file           = $args[0]
