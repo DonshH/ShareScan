@@ -121,7 +121,17 @@ function Get-AllFiles {
 
     $roboOutput = robocopy $RootPath NULL /L /S /NDL /NJH /NJS /NC /NP /FP /NS /MT:128 2>&1
 
-    $results = $roboOutput | ForEach-Object -Parallel {
+    ### code to print # of directories in share
+    $separatorIndex = ($roboOutput | Select-String '^\s*-{3,}' | Select-Object -Last 1).LineNumber - 1
+    $fileLines = $roboOutput[0..($separatorIndex - 1)]
+    $summary = $roboOutput[$separatorIndex..]
+
+    $dirLine = $summary | Where-Object { $_ -match '^\s*Dirs\s*:' } | Select-Object -First 1
+    $dirCount = ($dirLine -replace '^\s*Dirs\s*:\s*', '' -replace '\s+.*').Trim()
+    Write-Host "    Total directories in $RootPath : $dirCount" -ForegroundColor Cyan
+    ###
+
+    $results = $fileLines | ForEach-Object -Parallel {
         $trimmed = $_.Trim()
 
         if ([string]::IsNullOrWhiteSpace($trimmed)) { return }
