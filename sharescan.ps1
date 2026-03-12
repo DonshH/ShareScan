@@ -107,15 +107,6 @@ $lock = [System.Object]::new()
 $servers = Get-Content $serverList -ErrorAction Stop
 $scanStart = Get-Date
 
-### TCP Listener for Displaying progress via python ###
-$listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 9999)
-$listener.Start()
-Start-Process python -ArgumentList "progress_display.py" -NoNewWindow:$false
-$client = $listener.AcceptTcpClient()
-$writer = [System.IO.StreamWriter]::new($client.GetStream())
-$writer.AutoFlush = $true
-
-
 # Queue for displaying stuff
 $writeQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
 
@@ -140,12 +131,8 @@ function Get-AllFiles {
     $summary = $roboOutput[$separatorIndex..($roboOutput.Count - 1)]
 
     $dirLine = $summary | Where-Object { $_ -match '^\s*Dirs\s*:' } | Select-Object -First 1
-    $dirCount = ($dirLine -replace '^\s*Dirs\s*:\s*', '' -replace '\s+.*').Trim()
+    $dirCount = ([string]($dirLine -replace '^\s*Dirs\s*:\s*', '' -replace '\s+.*')).Trim()
     Write-Host "    Total directories in $RootPath : $dirCount" -ForegroundColor DarkCyan
-    ###
-
-    #Output to python script
-    $script:writer.WriteLine((@{ type='dir_count'; count=$dirCount; path=$RootPath } | ConvertTo-Json -Compress))
 
     $results = $fileLines | ForEach-Object -Parallel {
         $trimmed = $_.Trim()
@@ -227,22 +214,6 @@ function Get-ShareNames {
     return @($shares)
 }
 
-
-# Helper to drain the queue and send to writer - called from main thread
-function Send-WriteQueue {
-    $item = $null
-    while ($writeQueue.TryDequeue([ref]$item)) {
-        try {
-            $writer.WriteLine($item)
-        } catch { }
-    }
-}
-
-
-
-
-
-
 # ────────────────────────────────────────────────────────────────
 #   MAIN LOOP - one IP at a time
 # ────────────────────────────────────────────────────────────────
@@ -301,23 +272,10 @@ foreach ($server in $servers) {
                 $sync           = $args[11]
                 $fileTot        = $args[12]
 
-                #Output to python script
+                #progress bar
                 $count = [System.Threading.Interlocked]::Increment([ref]$sync.FileIndex)
-                # [System.Threading.Monitor]::Enter($lock)
-                # try {
-                #     $writer.WriteLine((@{ type='log'; message="Scanning $($file.FullName)" } | ConvertTo-Json -Compress))
-                #     #### This currently does not work, as i cant get the counter to be threadsafe
-                #     $writer.WriteLine((@{ type='file_progress'; current=$fileIndex.Value; total=$fileTot } | ConvertTo-Json -Compress))
-                #     ####
-                # } finally { [System.Threading.Monitor]::Exit($lock) }
-                ###
-                while ($fileJobs | Where-Object { $_.State -eq 'Running' }) {
-                    $count = $sync.FileIndex
-                    Write-Progress -Id 3 -ParentId 2 -Activity "Scanning Files" -Status "[$count/$fileTot] $($foundfile.FullName)" -PercentComplete (($count / $fileTot) * 100)
-                    Start-Sleep -Milliseconds 300
-                }
-
-                ####
+                $writeQueue = $using:writeQueue
+                $writeQueue.Enqueue("   Scanning $($file.FullName)...")
 
                 try {
                     # ── 1. Filename keyword scan ──────────────────────────
@@ -390,8 +348,8 @@ foreach ($server in $servers) {
             }
         }
 
-            # Monitor progress while jobs run
-        while ($fileJobs | Where-Object { $_.State -eq 'Running' }) {
+        # Monitor progress while jobs run
+        while ($fileJobs | Where-Object { $_.State -eq 'Running' -or $_.State -eq 'NotStarted' }) {
             $count = $sync.FileIndex
             Write-Progress -Id 3 -ParentId 2 -Activity "Scanning Files" -Status "[$count/$fileTot]" -PercentComplete (($count / [Math]::Max($fileTot,1)) * 100)
             $item = $null
@@ -406,8 +364,6 @@ foreach ($server in $servers) {
         while ($writeQueue.TryDequeue([ref]$item)) {
             Write-Host $item -ForegroundColor Cyan
         }
-
-
 
         # Wait for all file jobs in this share then clean up
         $fileJobs | Wait-Job | Receive-Job | Out-Null
@@ -434,10 +390,6 @@ foreach ($server in $servers) {
     Write-Host "  $server completed." -ForegroundColor Green
 }
 
-# Close connection
-# $writer.Close()
-# $client.Close()
-# $listener.Stop()
 Write-Progress -Id 1 -Completed
 Write-Progress -Id 2 -Completed
 Write-Progress -Id 3 -Completed
