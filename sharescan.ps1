@@ -251,7 +251,7 @@ foreach ($server in $servers) {
         Write-Host "    $fileTot files found in $searchPath"
 
         $fileJobs = @()
-        $sync = [hashtable]::Synchronized(@{ FileIndex = 0 })
+        $sync = [int[]](,0)
 
         foreach ($foundfile in $tempAllPaths) {
             #This line prints the files to console. comment it out to remove spam
@@ -273,7 +273,7 @@ foreach ($server in $servers) {
                 $fileTot        = $args[12]
 
                 #progress bar
-                $count = [System.Threading.Interlocked]::Increment([ref]$sync.FileIndex)
+                $count = [System.Threading.Interlocked]::Increment([ref]$sync[0])
                 $writeQueue = $using:writeQueue
                 $writeQueue.Enqueue("   Scanning $($file.FullName)...")
 
@@ -350,7 +350,7 @@ foreach ($server in $servers) {
 
         # Monitor progress while jobs run
         while ($fileJobs | Where-Object { $_.State -eq 'Running' -or $_.State -eq 'NotStarted' }) {
-            $count = $sync.FileIndex
+            $count = $sync[0]
             Write-Progress -Id 3 -ParentId 2 -Activity "Scanning Files" -Status "[$count/$fileTot]" -PercentComplete (($count / [Math]::Max($fileTot,1)) * 100)
             $item = $null
             while ($writeQueue.TryDequeue([ref]$item)) {
