@@ -117,18 +117,45 @@ function Get-AllFiles {
         [Parameter(Mandatory)]
         [string]$RootPath,
 
-        [int]$ThrottleLimit = 8,
-
-        [int]$BatchSize = 10000,
-
         [ref]$ErrorList
     )
 
-    $results = @()
-    $batch = @()
-
+    # Enumerate files in current directory
     try {
-        $enumerator = [System.IO.Directory]::EnumerateFiles($RootPath, '*', 'AllDirectories').GetEnumerator()
+        foreach ($file in [System.IO.Directory]::EnumerateFiles($RootPath)) {
+            try {
+                $f = [System.IO.FileInfo]::new($file)
+                [PSCustomObject]@{
+                    Name         = $f.Name
+                    FullName     = $f.FullName
+                    Length       = $f.Length
+                    Extension    = $f.Extension
+                    CreationTime = $f.CreationTime
+                }
+            } catch {
+                if ($null -ne $ErrorList) {
+                    $ErrorList.Value += @{
+                        TargetObject = $file
+                        Exception    = $_.Exception
+                        Message      = "Error on Accessing"
+                    }
+                }
+            }
+        }
+    } catch {
+        if ($null -ne $ErrorList) {
+            $ErrorList.Value += @{
+                TargetObject = $RootPath
+                Exception    = $_.Exception
+                Message      = "Error on Accessing"
+            }
+        }
+    }
+
+    # Enumerate subdirectories and recurse
+    $subdirs = @()
+    try {
+        $subdirs = [System.IO.Directory]::EnumerateDirectories($RootPath)
     } catch {
         if ($null -ne $ErrorList) {
             $ErrorList.Value += @{
@@ -140,60 +167,8 @@ function Get-AllFiles {
         return
     }
 
-    while ($enumerator.MoveNext()) {
-        $batch += $enumerator.Current
-        if ($batch.Count -ge $BatchSize) {
-            $results += $batch | ForEach-Object -Parallel {
-                $path = $_
-                try {
-                    $f = [System.IO.FileInfo]::new($path)
-                    [PSCustomObject]@{
-                        Name         = $f.Name
-                        FullName     = $f.FullName
-                        Length       = $f.Length
-                        Extension    = $f.Extension
-                        CreationTime = $f.CreationTime
-                    }
-                } catch {
-                    [PSCustomObject]@{__IsError = $true; Data = @{
-                        TargetObject = $path
-                        Exception    = $_.Exception
-                        Message      = $_.Exception.Message
-                    }}
-                }
-            } -ThrottleLimit $ThrottleLimit
-            $batch = @()
-        }
-    }
-
-    if ($batch.Count -gt 0) {
-        $results += $batch | ForEach-Object -Parallel {
-            $path = $_
-            try {
-                $f = [System.IO.FileInfo]::new($path)
-                [PSCustomObject]@{
-                    Name         = $f.Name
-                    FullName     = $f.FullName
-                    Length       = $f.Length
-                    Extension    = $f.Extension
-                    CreationTime = $f.CreationTime
-                }
-            } catch {
-                [PSCustomObject]@{__IsError = $true; Data = @{
-                    TargetObject = $path
-                    Exception    = $_.Exception
-                    Message      = $_.Exception.Message
-                }}
-            }
-        } -ThrottleLimit $ThrottleLimit
-    }
-
-    foreach ($item in $results) {
-        if ($item -is [PSObject] -and $item.PSObject.Properties['__IsError']) {
-            if ($null -ne $ErrorList) { $ErrorList.Value += $item.Data }
-        } else {
-            $item
-        }
+    foreach ($subdir in $subdirs) {
+        Get-AllFiles -Path $subdir -ErrorList $ErrorList
     }
 }
 
@@ -262,7 +237,7 @@ foreach ($server in $servers) {
         $problems = @()
         $tempAllPaths = Get-AllFiles -RootPath $searchPath -ErrorList ([ref]$problems)
 
-        Write-Host "    $($tempAllPaths.Count) files found in $share"
+        Write-Host "    $($tempAllPaths.Count) files found in $searchPath"
 
         $fileJobs = @()
 
