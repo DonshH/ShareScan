@@ -107,6 +107,18 @@ $lock = [System.Object]::new()
 $servers = Get-Content $serverList -ErrorAction Stop
 $scanStart = Get-Date
 
+### TCP Listener for Displaying progress via python ###
+$listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 9999)
+$listener.Start()
+Start-Process python -ArgumentList "progress_display.py" -NoNewWindow:$false
+$client = $listener.AcceptTcpClient()
+$writer = [System.IO.StreamWriter]::new($client.GetStream())
+$writer.AutoFlush = $true
+
+
+
+
+
 # ────────────────────────────────────────────────────────────────
 #   FUNCTION: Enumerate files (with batch parallel processing)
 # ────────────────────────────────────────────────────────────────
@@ -124,12 +136,15 @@ function Get-AllFiles {
     ### code to print # of directories in share
     $separatorIndex = ($roboOutput | Select-String '^\s*-{3,}' | Select-Object -Last 1).LineNumber - 1
     $fileLines = $roboOutput[0..($separatorIndex - 1)]
-    $summary = $roboOutput[$separatorIndex..]
+    $summary = $roboOutput[$separatorIndex..($roboOutput.Count - 1)]
 
     $dirLine = $summary | Where-Object { $_ -match '^\s*Dirs\s*:' } | Select-Object -First 1
     $dirCount = ($dirLine -replace '^\s*Dirs\s*:\s*', '' -replace '\s+.*').Trim()
-    Write-Host "    Total directories in $RootPath : $dirCount" -ForegroundColor Cyan
+    Write-Host "    Total directories in $RootPath : $dirCount" -ForegroundColor DarkCyan
     ###
+
+    #Output to python script
+    $script:writer.WriteLine((@{ type='dir_count'; count=$dirCount; path=$RootPath } | ConvertTo-Json -Compress))
 
     $results = $fileLines | ForEach-Object -Parallel {
         $trimmed = $_.Trim()
@@ -220,6 +235,9 @@ foreach ($server in $servers) {
     $ipIndex++
     Write-Host "[$ipIndex/$($servers.Count)] Scanning $server ..." -ForegroundColor Cyan
 
+    #Output to python script
+    $writer.WriteLine((@{ type='ip_progress'; current=$ipIndex; total=$servers.Count } | ConvertTo-Json -Compress))
+
     $shares = Get-ShareNames $server
     if (-not $shares) {
         Write-Host "  No shares found or access denied on $server" -ForegroundColor Yellow
@@ -233,17 +251,23 @@ foreach ($server in $servers) {
         $searchPath = "\\$server\$share"
         Write-Host "  [$shareIndex/$($shares.Count)] Scanning $searchPath ..." -ForegroundColor Cyan
 
+        #Output to python script
+        $writer.WriteLine((@{ type='share_progress'; current=$shareIndex; total=$shares.Count; share=$searchPath } | ConvertTo-Json -Compress))
+
         $fileKey = "$server\$share"
         $problems = @()
         $tempAllPaths = Get-AllFiles -RootPath $searchPath -ErrorList ([ref]$problems)
 
-        Write-Host "    $($tempAllPaths.Count) files found in $searchPath"
+        $fileTot = $tempAllPaths.Count
+        Write-Host "    $fileTot files found in $searchPath"
 
         $fileJobs = @()
+        $sync = [hashtable]::Synchronized(@{ FileIndex = 0 })
 
         foreach ($foundfile in $tempAllPaths) {
-            Write-Host "   Scanning $($foundfile.FullName) ..." -ForegroundColor Cyan
-            $fileJobs += Start-ThreadJob -ThrottleLimit $throttle -ArgumentList $foundfile, $server, $share, $timestamp, $fileKey, $lock, $keywords, $fileExtensions, $outputCsvFile, $dbPath, $tableName -ScriptBlock {
+            #This line prints the files to console. comment it out to remove spam
+            #Write-Host "   Scanning $($foundfile.FullName) ..." -ForegroundColor Cyan
+            $fileJobs += Start-ThreadJob -ThrottleLimit $throttle -ArgumentList $foundfile, $server, $share, $timestamp, $fileKey, $lock, $keywords, $fileExtensions, $outputCsvFile, $dbPath, $tableName, $sync, $fileTot -ScriptBlock {
 
                 $file           = $args[0]
                 $server         = $args[1]
@@ -256,6 +280,19 @@ foreach ($server in $servers) {
                 $outputCsvFile  = $args[8]
                 $dbPath         = $args[9]
                 $tableName      = $args[10]
+                $sync           = $args[11]
+                $fileTot        = $args[12]
+
+                #Output to python script
+                $sync.Counter++
+                [System.Threading.Monitor]::Enter($lock)
+                try {
+                    $writer.WriteLine((@{ type='log'; message="Scanning $($file.FullName)" } | ConvertTo-Json -Compress))
+                    #### This currently does not work, as i cant get the counter to be threadsafe
+                    $writer.WriteLine((@{ type='file_progress'; current=$fileIndex.Value; total=$fileTot } | ConvertTo-Json -Compress))
+                    ####
+                } finally { [System.Threading.Monitor]::Exit($lock) }
+                ###
 
                 try {
                     # ── 1. Filename keyword scan ──────────────────────────
