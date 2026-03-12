@@ -389,6 +389,11 @@ foreach ($server in $servers) {
     Write-Host "  $server completed." -ForegroundColor Green
 }
 
+# Close connection
+$writer.Close()
+$client.Close()
+$listener.Stop()
+
 Write-Host "`nScan completed." -ForegroundColor Green
 Write-Host "Results saved to: $outputCsvFile"
 Write-Host "Database:         $dbPath"
