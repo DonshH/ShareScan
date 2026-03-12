@@ -116,7 +116,8 @@ $writer = [System.IO.StreamWriter]::new($client.GetStream())
 $writer.AutoFlush = $true
 
 
-
+# Queue for displaying stuff
+$writeQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
 
 
 # ────────────────────────────────────────────────────────────────
@@ -131,7 +132,7 @@ function Get-AllFiles {
         [ref]$ErrorList
     )
 
-    $roboOutput = robocopy $RootPath NULL /L /S /NDL /NJH /NJS /NC /NP /FP /NS /MT:128 2>&1
+    $roboOutput = robocopy $RootPath NULL /L /S /NDL /NJH /NC /NP /FP /NS /MT:128 2>&1
 
     ### code to print # of directories in share
     $separatorIndex = ($roboOutput | Select-String '^\s*-{3,}' | Select-Object -Last 1).LineNumber - 1
@@ -226,6 +227,22 @@ function Get-ShareNames {
     return @($shares)
 }
 
+
+# Helper to drain the queue and send to writer - called from main thread
+function Send-WriteQueue {
+    $item = $null
+    while ($writeQueue.TryDequeue([ref]$item)) {
+        try {
+            $writer.WriteLine($item)
+        } catch { }
+    }
+}
+
+
+
+
+
+
 # ────────────────────────────────────────────────────────────────
 #   MAIN LOOP - one IP at a time
 # ────────────────────────────────────────────────────────────────
@@ -235,8 +252,8 @@ foreach ($server in $servers) {
     $ipIndex++
     Write-Host "[$ipIndex/$($servers.Count)] Scanning $server ..." -ForegroundColor Cyan
 
-    #Output to python script
-    $writer.WriteLine((@{ type='ip_progress'; current=$ipIndex; total=$servers.Count } | ConvertTo-Json -Compress))
+    # progress bar
+    Write-Progress -Id 1 -Activity "Scanning IPs" -Status "[$ipIndex/$($servers.Count)] $server" -PercentComplete (($ipIndex / $servers.Count) * 100)
 
     $shares = Get-ShareNames $server
     if (-not $shares) {
@@ -251,8 +268,9 @@ foreach ($server in $servers) {
         $searchPath = "\\$server\$share"
         Write-Host "  [$shareIndex/$($shares.Count)] Scanning $searchPath ..." -ForegroundColor Cyan
 
-        #Output to python script
-        $writer.WriteLine((@{ type='share_progress'; current=$shareIndex; total=$shares.Count; share=$searchPath } | ConvertTo-Json -Compress))
+        #progress bar
+        Write-Progress -Id 2 -ParentId 1 -Activity "Scanning Shares" -Status "[$shareIndex/$($shares.Count)] $share" -PercentComplete (($shareIndex / $shares.Count) * 100)
+
 
         $fileKey = "$server\$share"
         $problems = @()
@@ -284,15 +302,22 @@ foreach ($server in $servers) {
                 $fileTot        = $args[12]
 
                 #Output to python script
-                $sync.Counter++
-                [System.Threading.Monitor]::Enter($lock)
-                try {
-                    $writer.WriteLine((@{ type='log'; message="Scanning $($file.FullName)" } | ConvertTo-Json -Compress))
-                    #### This currently does not work, as i cant get the counter to be threadsafe
-                    $writer.WriteLine((@{ type='file_progress'; current=$fileIndex.Value; total=$fileTot } | ConvertTo-Json -Compress))
-                    ####
-                } finally { [System.Threading.Monitor]::Exit($lock) }
+                $count = [System.Threading.Interlocked]::Increment([ref]$sync.FileIndex)
+                # [System.Threading.Monitor]::Enter($lock)
+                # try {
+                #     $writer.WriteLine((@{ type='log'; message="Scanning $($file.FullName)" } | ConvertTo-Json -Compress))
+                #     #### This currently does not work, as i cant get the counter to be threadsafe
+                #     $writer.WriteLine((@{ type='file_progress'; current=$fileIndex.Value; total=$fileTot } | ConvertTo-Json -Compress))
+                #     ####
+                # } finally { [System.Threading.Monitor]::Exit($lock) }
                 ###
+                while ($fileJobs | Where-Object { $_.State -eq 'Running' }) {
+                    $count = $sync.FileIndex
+                    Write-Progress -Id 3 -ParentId 2 -Activity "Scanning Files" -Status "[$count/$fileTot] $($foundfile.FullName)" -PercentComplete (($count / $fileTot) * 100)
+                    Start-Sleep -Milliseconds 300
+                }
+
+                ####
 
                 try {
                     # ── 1. Filename keyword scan ──────────────────────────
@@ -365,9 +390,29 @@ foreach ($server in $servers) {
             }
         }
 
+            # Monitor progress while jobs run
+        while ($fileJobs | Where-Object { $_.State -eq 'Running' }) {
+            $count = $sync.FileIndex
+            Write-Progress -Id 3 -ParentId 2 -Activity "Scanning Files" -Status "[$count/$fileTot]" -PercentComplete (($count / [Math]::Max($fileTot,1)) * 100)
+            $item = $null
+            while ($writeQueue.TryDequeue([ref]$item)) {
+                Write-Host $item -ForegroundColor Cyan
+            }
+            Start-Sleep -Milliseconds 300
+        }
+
+        # Final drain and cleanup
+        $item = $null
+        while ($writeQueue.TryDequeue([ref]$item)) {
+            Write-Host $item -ForegroundColor Cyan
+        }
+
+
+
         # Wait for all file jobs in this share then clean up
         $fileJobs | Wait-Job | Receive-Job | Out-Null
         $fileJobs | Remove-Job -Force
+        Write-Progress -Id 3 -Completed
 
         # Report enumeration errors
         foreach ($prob in $problems) {
@@ -390,9 +435,12 @@ foreach ($server in $servers) {
 }
 
 # Close connection
-$writer.Close()
-$client.Close()
-$listener.Stop()
+# $writer.Close()
+# $client.Close()
+# $listener.Stop()
+Write-Progress -Id 1 -Completed
+Write-Progress -Id 2 -Completed
+Write-Progress -Id 3 -Completed
 
 Write-Host "`nScan completed." -ForegroundColor Green
 Write-Host "Results saved to: $outputCsvFile"
