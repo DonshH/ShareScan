@@ -116,59 +116,48 @@ function Get-AllFiles {
     param(
         [Parameter(Mandatory)]
         [string]$RootPath,
-
         [ref]$ErrorList
     )
 
-    # Enumerate files in current directory
-    try {
-        foreach ($file in [System.IO.Directory]::EnumerateFiles($RootPath)) {
-            try {
-                $f = [System.IO.FileInfo]::new($file)
-                [PSCustomObject]@{
-                    Name         = $f.Name
-                    FullName     = $f.FullName
-                    Length       = $f.Length
-                    Extension    = $f.Extension
-                    CreationTime = $f.CreationTime
-                }
-            } catch {
-                if ($null -ne $ErrorList) {
-                    $ErrorList.Value += @{
-                        TargetObject = $file
-                        Exception    = $_.Exception
-                        Message      = "Error on Accessing"
-                    }
+    $roboOutput = robocopy $RootPath NULL /L /S /NFL /NDL /NJH /NJS /NC /FP /NS /MT:128 2>&1
+
+    foreach ($line in $roboOutput) {
+        $trimmed = $line.Trim()
+
+        # Skip empty lines
+        if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
+
+        # Catch access denied errors
+        if ($trimmed -match 'Access is denied|ERROR') {
+            if ($null -ne $ErrorList) {
+                $ErrorList.Value += @{
+                    TargetObject = $trimmed
+                    Exception    = $null
+                    Message      = "Error on Accessing"
                 }
             }
+            continue
         }
-    } catch {
-        if ($null -ne $ErrorList) {
-            $ErrorList.Value += @{
-                TargetObject = $RootPath
-                Exception    = $_.Exception
-                Message      = "Error on Accessing"
+
+        # Each line is a full file path
+        try {
+            $f = [System.IO.FileInfo]::new($trimmed)
+            [PSCustomObject]@{
+                Name         = $f.Name
+                FullName     = $f.FullName
+                Length       = $f.Length
+                Extension    = $f.Extension
+                CreationTime = $f.CreationTime
+            }
+        } catch {
+            if ($null -ne $ErrorList) {
+                $ErrorList.Value += @{
+                    TargetObject = $trimmed
+                    Exception    = $_.Exception
+                    Message      = "Error on Accessing"
+                }
             }
         }
-    }
-
-    # Enumerate subdirectories and recurse
-    $subdirs = @()
-    try {
-        $subdirs = [System.IO.Directory]::EnumerateDirectories($RootPath)
-    } catch {
-        if ($null -ne $ErrorList) {
-            $ErrorList.Value += @{
-                TargetObject = $RootPath
-                Exception    = $_.Exception
-                Message      = "Error on Accessing"
-            }
-        }
-        return
-    }
-
-    foreach ($subdir in $subdirs) {
-        Get-AllFiles -Path $subdir -ErrorList $ErrorList
     }
 }
 
@@ -257,6 +246,7 @@ foreach ($server in $servers) {
                 $tableName      = $args[10]
 
                 try {
+                    Write-Host "Scanning $($file.FullName)"
                     # ── 1. Filename keyword scan ──────────────────────────
                     $nameMatches = @($keywords.Where{ $file.FullName -match [regex]::Escape($_) })
                     if ($nameMatches.Count -gt 0) {
