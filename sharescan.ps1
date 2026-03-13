@@ -364,7 +364,8 @@ foreach ($server in $servers) {
                         $csvLines.Add("$($parts[0]),$($parts[1]),$($parts[2]),$($parts[3]),$($parts[4]),$($parts[5]),$($parts[6]),""$($parts[7])"",""$($parts[8])"",""$($parts[9])""")
                         $inserts.Add("INSERT INTO $($script:tableName) (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$($parts[0] -replace "'","''")', '$($parts[1] -replace "'","''")', '$($parts[2] -replace "'","''")', '$($parts[3] -replace "'","''")', '$($parts[4])', '$($parts[5])', '$($parts[6])', '$($parts[7] -replace "'","''")', '$($parts[8] -replace "'","''")', '$($parts[9] -replace "'","''")');")
                     } else {
-                        Write-Host $item -ForegroundColor Cyan
+                        # this is for printing to console the files being scanned. comment it for less spam
+                        #Write-Host $item -ForegroundColor Cyan
                     }
                 }
 
@@ -376,7 +377,7 @@ foreach ($server in $servers) {
                     $sql | sqlite3 $script:dbPath
                 }
 
-                Start-Sleep -Milliseconds 300
+                Start-Sleep -Milliseconds 500
             }
 
             # Final drain
