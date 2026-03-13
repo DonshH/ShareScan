@@ -123,7 +123,7 @@ function Get-AllFiles {
         [ref]$ErrorList
     )
 
-    $roboOutput = robocopy $RootPath NULL /L /S /NDL /NJH /NC /NP /FP /NS /MT:128 2>&1
+    $roboOutput = robocopy $RootPath NULL /L /S /NDL /NJH /NC /NP /FP /TS /BYTES /MT:128 2>&1
 
     ### code to print # of directories in share
     $separatorIndex = ($roboOutput | Select-String '^\s*-{3,}' | Select-Object -Last 1).LineNumber - 1
@@ -148,24 +148,24 @@ function Get-AllFiles {
             return
         }
 
-        try {
-            $f = [System.IO.FileInfo]::new($trimmed)
-            [PSCustomObject]@{
-                Name         = $f.Name
-                FullName     = $f.FullName
-                Length       = $f.Length
-                Extension    = $f.Extension
-                CreationTime = $f.CreationTime
+        if ($trimmed -match '^(\d+)\s+(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})\s+(\\\\[^\s].+)$') {
+            try {
+                [PSCustomObject]@{
+                    Name         = [System.IO.Path]::GetFileName($Matches[3])
+                    FullName     = $Matches[3]
+                    Length       = [long]$Matches[1]
+                    Extension    = [System.IO.Path]::GetExtension($Matches[3])
+                    CreationTime = [datetime]::Parse($Matches[2])
+                }
+            } catch {
+                [PSCustomObject]@{__IsError = $true; Data = @{
+                    TargetObject = $trimmed
+                    Exception    = $_.Exception
+                    Message      = "Error on Accessing"
+                }}
             }
-        } catch {
-            [PSCustomObject]@{__IsError = $true; Data = @{
-                TargetObject = $trimmed
-                Exception    = $_.Exception
-                Message      = "Error on Accessing"
-            }}
         }
     } -ThrottleLimit 16
-
     foreach ($item in $results) {
         if ($item -is [PSObject] -and $item.PSObject.Properties['__IsError']) {
             if ($null -ne $ErrorList) { $ErrorList.Value += $item.Data }
@@ -356,6 +356,7 @@ foreach ($server in $servers) {
             Write-Progress -Id 3 -ParentId 2 -Activity "Scanning Files" -Status "[$count/$fileTot]" -PercentComplete (($count / [Math]::Max($fileTot,1)) * 100)
             $item = $null
             while ($writeQueue.TryDequeue([ref]$item)) {
+                #This line prints the files to console. comment it out to remove spam
                 Write-Host $item -ForegroundColor Cyan
             }
             Start-Sleep -Milliseconds 300
