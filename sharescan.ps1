@@ -109,7 +109,7 @@ $scanStart = Get-Date
 
 # Queue for displaying stuff
 $writeQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
-
+$fileCounter = [System.Collections.Concurrent.ConcurrentDictionary[string,int]]::new()
 
 # ────────────────────────────────────────────────────────────────
 #   FUNCTION: Enumerate files (with batch parallel processing)
@@ -251,12 +251,12 @@ foreach ($server in $servers) {
         Write-Host "    $fileTot files found in $searchPath"
 
         $fileJobs = @()
-        $sync = [int[]](,0)
+        $fileCounter[$fileKey] = 0
 
         foreach ($foundfile in $tempAllPaths) {
             #This line prints the files to console. comment it out to remove spam
             #Write-Host "   Scanning $($foundfile.FullName) ..." -ForegroundColor Cyan
-            $fileJobs += Start-ThreadJob -ThrottleLimit $throttle -ArgumentList $foundfile, $server, $share, $timestamp, $fileKey, $lock, $keywords, $fileExtensions, $outputCsvFile, $dbPath, $tableName, $sync, $fileTot -ScriptBlock {
+            $fileJobs += Start-ThreadJob -ThrottleLimit $throttle -ArgumentList $foundfile, $server, $share, $timestamp, $fileKey, $lock, $keywords, $fileExtensions, $outputCsvFile, $dbPath, $tableName, $fileCounter -ScriptBlock {
 
                 $file           = $args[0]
                 $server         = $args[1]
@@ -269,11 +269,9 @@ foreach ($server in $servers) {
                 $outputCsvFile  = $args[8]
                 $dbPath         = $args[9]
                 $tableName      = $args[10]
-                $sync           = $args[11]
-                $fileTot        = $args[12]
+                $fileCounter    = $args[11]
 
                 #progress bar
-                $count = [System.Threading.Interlocked]::Increment([ref]$sync[0])
                 $writeQueue = $using:writeQueue
                 $writeQueue.Enqueue("   Scanning $($file.FullName)...")
 
@@ -345,12 +343,16 @@ foreach ($server in $servers) {
                         echo $insert | sqlite3 $dbPath
                     } finally { [System.Threading.Monitor]::Exit($lock) }
                 }
+                # ── Update file progress ──────────────────────────────────
+                # fileCounter holds int values — AddOrUpdate on int is truly atomic across thread boundaries.
+                $fileCounter.AddOrUpdate($fileKey, 1, [Func[string, int, int]]{ param($k, $v) $v + 1 }) | Out-Null
             }
         }
 
         # Monitor progress while jobs run
         while ($fileJobs | Where-Object { $_.State -eq 'Running' -or $_.State -eq 'NotStarted' }) {
-            $count = $sync[0]
+            $count = 0
+            $fileCounter.TryGetValue($fileKey, [ref]$count) | Out-Null
             Write-Progress -Id 3 -ParentId 2 -Activity "Scanning Files" -Status "[$count/$fileTot]" -PercentComplete (($count / [Math]::Max($fileTot,1)) * 100)
             $item = $null
             while ($writeQueue.TryDequeue([ref]$item)) {
