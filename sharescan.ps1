@@ -292,38 +292,29 @@ foreach ($server in $servers) {
                         $nameMatches = @($keywords.Where{ $file.FullName -match [regex]::Escape($_) })
                         if ($nameMatches.Count -gt 0) {
                             $perms = $null
-                            $acl = try { Get-Acl $file.FullName } catch { $perms = "Error: Unable to read permissions" }
+                            # $acl = try { Get-Acl $file.FullName } catch { $perms = "Error: Unable to read permissions" }
                             $foundStr = $nameMatches -join ","
-                            $line = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),""$perms"",""$foundStr"",Keyword in filename"
-                            $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','$($perms -replace "'","''")','$($foundStr -replace "'","''")','Keyword in filename');"
-                            [System.Threading.Monitor]::Enter($lock)
-                            try {
-                                $line | Out-File $outputCsvFile -Append -Encoding utf8
-                                echo $insert | sqlite3 $dbPath
-                            } finally { [System.Threading.Monitor]::Exit($lock) }
+                            # $line = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),""$perms"",""$foundStr"",Keyword in filename"
+                            # $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','$($perms -replace "'","''")','$($foundStr -replace "'","''")','Keyword in filename');"
+                            # queuing the writes
+                            $writeQueue.Enqueue("INSERT|$server|$share|$($file.Name)|$($file.FullName)|$($file.CreationTime)|$timestamp|$($file.Length)|$perms|$foundStr|Keyword in filename")
                         }
 
                         # ── 2. Extension check — skip if unsupported ───────────
                         if ($fileExtensions -notcontains $file.Extension) {
-                            $line = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),,,'Skipped: unsupported extension'"
-                            $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','','','Skipped: unsupported extension');"
-                            [System.Threading.Monitor]::Enter($lock)
-                            try {
-                                $line | Out-File $outputCsvFile -Append -Encoding utf8
-                                echo $insert | sqlite3 $dbPath
-                            } finally { [System.Threading.Monitor]::Exit($lock) }
+                            # $line = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),,,'Skipped: unsupported extension'"
+                            # $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','','','Skipped: unsupported extension');"
+                            # queue the writes
+                            $writeQueue.Enqueue("INSERT|$server|$share|$($file.Name)|$($file.FullName)|$($file.CreationTime)|$timestamp|$($file.Length)|||Skipped: unsupported extension")
                             return
                         }
 
                         # ── 3. Size check — skip if > 1GB ─────────────────────
                         if ($file.Length -gt 1GB) {
-                            $line = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),,,'Skipped: file > 1GB'"
-                            $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','','','Skipped: file > 1GB');"
-                            [System.Threading.Monitor]::Enter($lock)
-                            try {
-                                $line | Out-File $outputCsvFile -Append -Encoding utf8
-                                echo $insert | sqlite3 $dbPath
-                            } finally { [System.Threading.Monitor]::Exit($lock) }
+                            # $line = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),,,'Skipped: file > 1GB'"
+                            # $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','','','Skipped: file > 1GB');"
+                            #queue the writes
+                            $writeQueue.Enqueue("INSERT|$server|$share|$($file.Name)|$($file.FullName)|$($file.CreationTime)|$timestamp|$($file.Length)|||Skipped: file > 1GB")
                             return
                         }
 
@@ -332,28 +323,26 @@ foreach ($server in $servers) {
                         $contentMatches = @($keywords.Where{ $content -match [regex]::Escape($_) })
                         if ($contentMatches.Count -gt 0) {
                             $perms = $null
-                            $acl = try { Get-Acl $file.FullName } catch { $perms = "Error: Unable to read permissions" }
+                            try { 
+                                $acl = Get-Acl $file.FullName
+                                $perms = $acl.AccessToString -replace "`r`n|`n|`r", " ; "
+                            } catch { 
+                                $perms = "Error: Unable to read permissions" 
+                            }
                             $foundStr = $contentMatches -join ","
-                            $line = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),""$perms"",""$foundStr"","
-                            $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','$($perms -replace "'","''")','$($foundStr -replace "'","''")','');"
-                            [System.Threading.Monitor]::Enter($lock)
-                            try {
-                                $line | Out-File $outputCsvFile -Append -Encoding utf8
-                                echo $insert | sqlite3 $dbPath
-                            } finally { [System.Threading.Monitor]::Exit($lock) }
+                            # $line = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),""$perms"",""$foundStr"","
+                            # $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','$($perms -replace "'","''")','$($foundStr -replace "'","''")','');"
+                            #queue the writes
+                            $writeQueue.Enqueue("INSERT|$server|$share|$($file.Name)|$($file.FullName)|$($file.CreationTime)|$timestamp|$($file.Length)|$perms|$foundStr|")
                         }
                     }
                     catch {
-                        $errPath  = $file.FullName -replace "'", "''"
-                        $errMsg   = $_.Exception.Message -replace "'", "''"
-                        $line = "$server,$share,,`'$errPath`',,$timestamp,,,,$errMsg"
-                        $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','','$errPath','','$timestamp','','','','Error on Accessing');"
+                        # $errPath  = $file.FullName -replace "'", "''"
+                        # $errMsg   = $_.Exception.Message -replace "'", "''"
+                        # $line = "$server,$share,,`'$errPath`',,$timestamp,,,,$errMsg"
+                        # $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','','$errPath','','$timestamp','','','','Error on Accessing');"
 
-                        [System.Threading.Monitor]::Enter($lock)
-                        try {
-                            $line | Out-File $outputCsvFile -Append -Encoding utf8
-                            echo $insert | sqlite3 $dbPath
-                        } finally { [System.Threading.Monitor]::Exit($lock) }
+                        $writeQueue.Enqueue("INSERT|$server|$share||$($file.FullName)||$timestamp||||Error on Accessing")
                     }
                 }
             }
@@ -364,16 +353,51 @@ foreach ($server in $servers) {
                 $fileCounter.TryGetValue($script:fileKey, [ref]$currentCount) | Out-Null
                 Write-Progress -Id 3 -ParentId 2 -Activity "Scanning Files" -Status "[$currentCount/$totalFiles]" -PercentComplete (($currentCount / [Math]::Max([int]$totalFiles, 1)) * 100)
                 $item = $null
-                while ($writeQueue.TryDequeue([ref]$item)) {
-                    Write-Host $item -ForegroundColor Cyan
+
+                $inserts = [System.Collections.Generic.List[string]]::new()
+                $csvLines = [System.Collections.Generic.List[string]]::new()
+                $logLines = [System.Collections.Generic.List[string]]::new()
+
+                while ($script:writeQueue.TryDequeue([ref]$item)) {
+                    if ($item.StartsWith('INSERT|')) {
+                        $parts = $item.Substring(7) -split '\|', 10
+                        $csvLines.Add("$($parts[0]),$($parts[1]),$($parts[2]),$($parts[3]),$($parts[4]),$($parts[5]),$($parts[6]),""$($parts[7])"",""$($parts[8])"",""$($parts[9])""")
+                        $inserts.Add("INSERT INTO $($script:tableName) (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$($parts[0] -replace "'","''")', '$($parts[1] -replace "'","''")', '$($parts[2] -replace "'","''")', '$($parts[3] -replace "'","''")', '$($parts[4])', '$($parts[5])', '$($parts[6])', '$($parts[7] -replace "'","''")', '$($parts[8] -replace "'","''")', '$($parts[9] -replace "'","''")');")
+                    } else {
+                        Write-Host $item -ForegroundColor Cyan
+                    }
                 }
+
+                if ($csvLines.Count -gt 0) {
+                    $csvLines | Out-File $script:outputCsvFile -Append -Encoding utf8
+                }
+                if ($inserts.Count -gt 0) {
+                    $sql = "BEGIN TRANSACTION;`n" + ($inserts -join "`n") + "`nCOMMIT;"
+                    $sql | sqlite3 $script:dbPath
+                }
+
                 Start-Sleep -Milliseconds 300
             }
 
             # Final drain
+            $inserts = [System.Collections.Generic.List[string]]::new()
+            $csvLines = [System.Collections.Generic.List[string]]::new()
             $item = $null
-            while ($writeQueue.TryDequeue([ref]$item)) {
-                Write-Host $item -ForegroundColor Cyan
+            while ($script:writeQueue.TryDequeue([ref]$item)) {
+                if ($item.StartsWith('INSERT|')) {
+                    $parts = $item.Substring(7) -split '\|', 10
+                    $csvLines.Add("$($parts[0]),$($parts[1]),$($parts[2]),$($parts[3]),$($parts[4]),$($parts[5]),$($parts[6]),$($parts[7]),$($parts[8]),$($parts[9])")
+                    $inserts.Add("INSERT INTO $($script:tableName) (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$($parts[0] -replace "'","''")', '$($parts[1] -replace "'","''")', '$($parts[2] -replace "'","''")', '$($parts[3] -replace "'","''")', '$($parts[4])', '$($parts[5])', '$($parts[6])', '$($parts[7] -replace "'","''")', '$($parts[8] -replace "'","''")', '$($parts[9] -replace "'","''")');")
+                } else {
+                    Write-Host $item -ForegroundColor Cyan
+                }
+            }
+            if ($csvLines.Count -gt 0) {
+                $csvLines | Out-File $script:outputCsvFile -Append -Encoding utf8
+            }
+            if ($inserts.Count -gt 0) {
+                $sql = "BEGIN TRANSACTION;`n" + ($inserts -join "`n") + "`nCOMMIT;"
+                $sql | sqlite3 $script:dbPath
             }
 
             $batchJobs | Wait-Job | Receive-Job | Out-Null
@@ -381,17 +405,22 @@ foreach ($server in $servers) {
         }
 
         # Report enumeration errors
-        foreach ($prob in $problems) {
-            $errPath = $prob.TargetObject -replace "'", "''"
-            $errMsg  = $prob.Message -replace "'", "''"
-            $line = "$server,$share,,`'$errPath`',,$timestamp,,,,$errMsg"
-            $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','','$errPath','','$timestamp','','','','$errMsg');"
+        $probInserts = [System.Collections.Generic.List[string]]::new()
+        $probCsvLines = [System.Collections.Generic.List[string]]::new()
 
-            [System.Threading.Monitor]::Enter($lock)
-            try {
-                $line | Out-File $outputCsvFile -Append -Encoding utf8
-                echo $insert | sqlite3 $dbPath
-            } finally { [System.Threading.Monitor]::Exit($lock) }
+        foreach ($prob in $problems) {
+            $errPath = $prob.TargetObject
+            $errMsg  = $prob.Message
+            $probCsvLines.Add("$script:server,$script:share,,`'$errPath`',,$script:timestamp,,,,$errMsg")
+            $probInserts.Add("INSERT INTO $script:tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$script:server','$script:share','','$($errPath -replace "'","''")','','$script:timestamp','','','','$($errMsg -replace "'","''")');")
+        }
+
+        if ($probCsvLines.Count -gt 0) {
+            $probCsvLines | Out-File $script:outputCsvFile -Append -Encoding utf8
+        }
+        if ($probInserts.Count -gt 0) {
+            $sql = "BEGIN TRANSACTION;`n" + ($probInserts -join "`n") + "`nCOMMIT;"
+            $sql | sqlite3 $script:dbPath
         }
 
         Write-Host "    Share $share done." -ForegroundColor Green
