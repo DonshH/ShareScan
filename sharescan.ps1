@@ -120,7 +120,9 @@ function Get-AllFiles {
     param(
         [Parameter(Mandatory)]
         [string]$RootPath,
-        [ref]$ErrorList
+        [ref]$ErrorList,
+        [int]$BatchSize = 10000,
+        [scriptblock]$OnBatch
     )
 
     $roboOutput = robocopy $RootPath NULL /L /S /NDL /NJH /NC /NP /FP /TS /BYTES /MT:128 2>&1
@@ -134,44 +136,40 @@ function Get-AllFiles {
     $dirCount = ([string]($dirLine -replace '^\s*Dirs\s*:\s*', '' -replace '\s+.*')).Trim()
     Write-Host "    Total directories in $RootPath : $dirCount" -ForegroundColor DarkCyan
 
-    $results = $fileLines | ForEach-Object -Parallel {
-        $trimmed = $_.Trim()
+    $totalFiles = 0
+    $fileLine = $summary | Where-Object { $_ -match '^\s*Files\s*:' } | Select-Object -First 1
+    $totalFiles = ([string]($fileLine -replace '^\s*Files\s*:\s*', '' -replace '\s+.*')).Trim()
+    Write-Host "    Total files in $RootPath : $totalFiles" -ForegroundColor DarkCyan
 
-        if ([string]::IsNullOrWhiteSpace($trimmed)) { return }
+    $batch = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($line in $fileLines) {
+        $trimmed = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
 
         if ($trimmed -match 'Access is denied|ERROR') {
-            [PSCustomObject]@{__IsError = $true; Data = @{
-                TargetObject = $trimmed
-                Exception    = $null
-                Message      = "Error on Accessing"
-            }}
-            return
+            if ($null -ne $ErrorList) {
+                $ErrorList.Value += @{
+                    TargetObject = $trimmed
+                    Exception    = $null
+                    Message      = "Error on Accessing"
+                }
+            }
+            continue
         }
 
         if ($trimmed -match '^(\d+)\s+(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})\s+(\\\\[^\s].+)$') {
-            try {
-                [PSCustomObject]@{
-                    Name         = [System.IO.Path]::GetFileName($Matches[3])
-                    FullName     = $Matches[3]
-                    Length       = [long]$Matches[1]
-                    Extension    = [System.IO.Path]::GetExtension($Matches[3])
-                    CreationTime = [datetime]::Parse($Matches[2])
-                }
-            } catch {
-                [PSCustomObject]@{__IsError = $true; Data = @{
-                    TargetObject = $trimmed
-                    Exception    = $_.Exception
-                    Message      = "Error on Accessing"
-                }}
-            }
+            $batch.Add($trimmed)
         }
-    } -ThrottleLimit 16
-    foreach ($item in $results) {
-        if ($item -is [PSObject] -and $item.PSObject.Properties['__IsError']) {
-            if ($null -ne $ErrorList) { $ErrorList.Value += $item.Data }
-        } else {
-            $item
+
+        if ($batch.Count -ge $BatchSize) {
+            & $OnBatch $batch $totalFiles
+            $batch.Clear()
         }
+    }
+
+    if ($batch.Count -gt 0) {
+        & $OnBatch $batch $totalFiles
     }
 }
 
@@ -245,133 +243,142 @@ foreach ($server in $servers) {
 
         $fileKey = "$server\$share"
         $problems = @()
-        $tempAllPaths = Get-AllFiles -RootPath $searchPath -ErrorList ([ref]$problems)
+        #$tempAllPaths = Get-AllFiles -RootPath $searchPath -ErrorList ([ref]$problems)
 
-        $fileTot = $tempAllPaths.Count
-        Write-Host "    $fileTot files found in $searchPath"
+        #$fileTot = $tempAllPaths.Count
+        #Write-Host "    $fileTot files found in $searchPath"
 
         $fileJobs = @()
         $fileCounter[$fileKey] = 0
 
-        foreach ($foundfile in $tempAllPaths) {
-            #This line prints the files to console. comment it out to remove spam
-            #Write-Host "   Scanning $($foundfile.FullName) ..." -ForegroundColor Cyan
-            $fileJobs += Start-ThreadJob -ThrottleLimit $throttle -ArgumentList $foundfile, $server, $share, $timestamp, $fileKey, $lock, $keywords, $fileExtensions, $outputCsvFile, $dbPath, $tableName, $fileCounter -ScriptBlock {
+        Get-AllFiles -RootPath $searchPath -ErrorList ([ref]$problems) -BatchSize 10000 -OnBatch {
+            param($batch, $totalFiles)
 
-                $file           = $args[0]
-                $server         = $args[1]
-                $share          = $args[2]
-                $timestamp      = $args[3]
-                $fileKey        = $args[4]
-                $lock           = $args[5]
-                $keywords       = $args[6]
-                $fileExtensions = $args[7]
-                $outputCsvFile  = $args[8]
-                $dbPath         = $args[9]
-                $tableName      = $args[10]
-                $fileCounter    = $args[11]
+            $batchJobs = @()
+            foreach ($rawLine in $batch) {
+                $batchJobs += Start-ThreadJob -ThrottleLimit $script:throttle -ArgumentList $rawLine, $script:server, $script:share, $script:timestamp, $script:fileKey, $script:lock, $script:keywords, $script:fileExtensions, $script:outputCsvFile, $script:dbPath, $script:tableName, $script:fileCounter, $totalFiles -ScriptBlock {
 
-                #progress bar
-                $writeQueue = $using:writeQueue
-                $writeQueue.Enqueue("   Scanning $($file.FullName)...")
+                    $rawLine        = $args[0]
+                    $server         = $args[1]
+                    $share          = $args[2]
+                    $timestamp      = $args[3]
+                    $fileKey        = $args[4]
+                    $lock           = $args[5]
+                    $keywords       = $args[6]
+                    $fileExtensions = $args[7]
+                    $outputCsvFile  = $args[8]
+                    $dbPath         = $args[9]
+                    $tableName      = $args[10]
+                    $fileCounter    = $args[11]
+                    $totalFiles     = $args[12]
 
-                try {
-                    # ── 1. Filename keyword scan ──────────────────────────
-                    $nameMatches = @($keywords.Where{ $file.FullName -match [regex]::Escape($_) })
-                    if ($nameMatches.Count -gt 0) {
-                        $perms = $null
-                        $acl = try { Get-Acl $file.FullName } catch { $perms = "Error: Unable to read permissions" }
-                        $foundStr = $nameMatches -join ","
-                        $line = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),""$perms"",""$foundStr"",Keyword in filename"
-                        $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','$($perms -replace "'","''")','$($foundStr -replace "'","''")','Keyword in filename');"
-                        [System.Threading.Monitor]::Enter($lock)
-                        try {
-                            $line | Out-File $outputCsvFile -Append -Encoding utf8
-                            echo $insert | sqlite3 $dbPath
-                        } finally { [System.Threading.Monitor]::Exit($lock) }
+                    # Parse raw line into file object
+                    if ($rawLine -notmatch '^(\d+)\s+(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})\s+(\\\\[^\s].+)$') { return }
+                    $file = [PSCustomObject]@{
+                        Name         = [System.IO.Path]::GetFileName($Matches[3])
+                        FullName     = $Matches[3]
+                        Length       = [long]$Matches[1]
+                        Extension    = [System.IO.Path]::GetExtension($Matches[3])
+                        CreationTime = [datetime]::Parse($Matches[2])
                     }
 
-                    # ── 2. Extension check — skip if unsupported ───────────
-                    if ($fileExtensions -notcontains $file.Extension) {
-                        $line = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),,,'Skipped: unsupported extension'"
-                        $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','','','Skipped: unsupported extension');"
-                        [System.Threading.Monitor]::Enter($lock)
-                        try {
-                            $line | Out-File $outputCsvFile -Append -Encoding utf8
-                            echo $insert | sqlite3 $dbPath
-                        } finally { [System.Threading.Monitor]::Exit($lock) }
-                        return
-                    }
+                    # increment counter and enqueue log
+                    $count = $fileCounter.AddOrUpdate($fileKey, 1, [Func[string,int,int]]{ param($k,$v) $v+1 })
+                    $writeQueue = $using:writeQueue
+                    $writeQueue.Enqueue("   Scanning $($file.FullName)...")
 
-                    # ── 3. Size check — skip if > 1GB ─────────────────────
-                    if ($file.Length -gt 1GB) {
-                        $line = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),,,'Skipped: file > 1GB'"
-                        $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','','','Skipped: file > 1GB');"
-                        [System.Threading.Monitor]::Enter($lock)
-                        try {
-                            $line | Out-File $outputCsvFile -Append -Encoding utf8
-                            echo $insert | sqlite3 $dbPath
-                        } finally { [System.Threading.Monitor]::Exit($lock) }
-                        return
-                    }
-
-                    # ── 4. Content keyword scan ────────────────────────────
-                    $content = Get-Content $file.FullName -Raw -ErrorAction Stop
-                    $contentMatches = @($keywords.Where{ $content -match [regex]::Escape($_) })
-                    if ($contentMatches.Count -gt 0) {
-                        $perms = $null
-                        $acl = try { Get-Acl $file.FullName } catch { $perms = "Error: Unable to read permissions" }
-                        $foundStr = $contentMatches -join ","
-                        $line = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),""$perms"",""$foundStr"","
-                        $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','$($perms -replace "'","''")','$($foundStr -replace "'","''")','');"
-                        [System.Threading.Monitor]::Enter($lock)
-                        try {
-                            $line | Out-File $outputCsvFile -Append -Encoding utf8
-                            echo $insert | sqlite3 $dbPath
-                        } finally { [System.Threading.Monitor]::Exit($lock) }
-                    }
-                }
-                catch {
-                    $errPath  = $file.FullName -replace "'", "''"
-                    $errMsg   = $_.Exception.Message -replace "'", "''"
-                    $line = "$server,$share,,`'$errPath`',,$timestamp,,,,$errMsg"
-                    $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','','$errPath','','$timestamp','','','','Error on Accessing');"
-
-                    [System.Threading.Monitor]::Enter($lock)
                     try {
-                        $line | Out-File $outputCsvFile -Append -Encoding utf8
-                        echo $insert | sqlite3 $dbPath
-                    } finally { [System.Threading.Monitor]::Exit($lock) }
-                }
-                # ── Update file progress ──────────────────────────────────
-                # fileCounter holds int values — AddOrUpdate on int is truly atomic across thread boundaries.
-                $fileCounter.AddOrUpdate($fileKey, 1, [Func[string, int, int]]{ param($k, $v) $v + 1 }) | Out-Null
-            }
-        }
+                        # ── 1. Filename keyword scan ──────────────────────────
+                        $nameMatches = @($keywords.Where{ $file.FullName -match [regex]::Escape($_) })
+                        if ($nameMatches.Count -gt 0) {
+                            $perms = $null
+                            $acl = try { Get-Acl $file.FullName } catch { $perms = "Error: Unable to read permissions" }
+                            $foundStr = $nameMatches -join ","
+                            $line = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),""$perms"",""$foundStr"",Keyword in filename"
+                            $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','$($perms -replace "'","''")','$($foundStr -replace "'","''")','Keyword in filename');"
+                            [System.Threading.Monitor]::Enter($lock)
+                            try {
+                                $line | Out-File $outputCsvFile -Append -Encoding utf8
+                                echo $insert | sqlite3 $dbPath
+                            } finally { [System.Threading.Monitor]::Exit($lock) }
+                        }
 
-        # Monitor progress while jobs run
-        while ($fileJobs | Where-Object { $_.State -eq 'Running' -or $_.State -eq 'NotStarted' }) {
-            $count = 0
-            $fileCounter.TryGetValue($fileKey, [ref]$count) | Out-Null
-            Write-Progress -Id 3 -ParentId 2 -Activity "Scanning Files" -Status "[$count/$fileTot]" -PercentComplete (($count / [Math]::Max($fileTot,1)) * 100)
+                        # ── 2. Extension check — skip if unsupported ───────────
+                        if ($fileExtensions -notcontains $file.Extension) {
+                            $line = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),,,'Skipped: unsupported extension'"
+                            $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','','','Skipped: unsupported extension');"
+                            [System.Threading.Monitor]::Enter($lock)
+                            try {
+                                $line | Out-File $outputCsvFile -Append -Encoding utf8
+                                echo $insert | sqlite3 $dbPath
+                            } finally { [System.Threading.Monitor]::Exit($lock) }
+                            return
+                        }
+
+                        # ── 3. Size check — skip if > 1GB ─────────────────────
+                        if ($file.Length -gt 1GB) {
+                            $line = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),,,'Skipped: file > 1GB'"
+                            $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','','','Skipped: file > 1GB');"
+                            [System.Threading.Monitor]::Enter($lock)
+                            try {
+                                $line | Out-File $outputCsvFile -Append -Encoding utf8
+                                echo $insert | sqlite3 $dbPath
+                            } finally { [System.Threading.Monitor]::Exit($lock) }
+                            return
+                        }
+
+                        # ── 4. Content keyword scan ────────────────────────────
+                        $content = Get-Content $file.FullName -Raw -ErrorAction Stop
+                        $contentMatches = @($keywords.Where{ $content -match [regex]::Escape($_) })
+                        if ($contentMatches.Count -gt 0) {
+                            $perms = $null
+                            $acl = try { Get-Acl $file.FullName } catch { $perms = "Error: Unable to read permissions" }
+                            $foundStr = $contentMatches -join ","
+                            $line = "$server,$share,$($file.Name),$($file.FullName),$($file.CreationTime),$timestamp,$($file.Length),""$perms"",""$foundStr"","
+                            $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','$($file.Name -replace "'","''")',`'$($file.FullName -replace "'","''")`','$($file.CreationTime)','$timestamp','$($file.Length)','$($perms -replace "'","''")','$($foundStr -replace "'","''")','');"
+                            [System.Threading.Monitor]::Enter($lock)
+                            try {
+                                $line | Out-File $outputCsvFile -Append -Encoding utf8
+                                echo $insert | sqlite3 $dbPath
+                            } finally { [System.Threading.Monitor]::Exit($lock) }
+                        }
+                    }
+                    catch {
+                        $errPath  = $file.FullName -replace "'", "''"
+                        $errMsg   = $_.Exception.Message -replace "'", "''"
+                        $line = "$server,$share,,`'$errPath`',,$timestamp,,,,$errMsg"
+                        $insert = "INSERT INTO $tableName (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$server','$share','','$errPath','','$timestamp','','','','Error on Accessing');"
+
+                        [System.Threading.Monitor]::Enter($lock)
+                        try {
+                            $line | Out-File $outputCsvFile -Append -Encoding utf8
+                            echo $insert | sqlite3 $dbPath
+                        } finally { [System.Threading.Monitor]::Exit($lock) }
+                    }
+                }
+            }
+
+            # Monitor and wait for batch
+            while ($batchJobs | Where-Object { $_.State -eq 'Running' -or $_.State -eq 'NotStarted' }) {
+                $currentCount = 0
+                $fileCounter.TryGetValue($script:fileKey, [ref]$currentCount) | Out-Null
+                Write-Progress -Id 3 -ParentId 2 -Activity "Scanning Files" -Status "[$currentCount/$totalFiles]" -PercentComplete (($currentCount / [Math]::Max([int]$totalFiles, 1)) * 100)
+                $item = $null
+                while ($writeQueue.TryDequeue([ref]$item)) {
+                    Write-Host $item -ForegroundColor Cyan
+                }
+                Start-Sleep -Milliseconds 300
+            }
+
+            # Final drain
             $item = $null
             while ($writeQueue.TryDequeue([ref]$item)) {
-                #This line prints the files to console. comment it out to remove spam
                 Write-Host $item -ForegroundColor Cyan
             }
-            Start-Sleep -Milliseconds 300
-        }
 
-        # Final drain and cleanup
-        $item = $null
-        while ($writeQueue.TryDequeue([ref]$item)) {
-            Write-Host $item -ForegroundColor Cyan
+            $batchJobs | Wait-Job | Receive-Job | Out-Null
+            $batchJobs | Remove-Job -Force
         }
-
-        # Wait for all file jobs in this share then clean up
-        $fileJobs | Wait-Job | Receive-Job | Out-Null
-        $fileJobs | Remove-Job -Force
-        Write-Progress -Id 3 -Completed
 
         # Report enumeration errors
         foreach ($prob in $problems) {
@@ -390,6 +397,7 @@ foreach ($server in $servers) {
         Write-Host "    Share $share done." -ForegroundColor Green
     }
 
+    Write-Progress -Id 3 -Completed
     Write-Host "  $server completed." -ForegroundColor Green
 }
 
