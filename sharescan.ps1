@@ -256,21 +256,17 @@ foreach ($server in $servers) {
 
             $batchJobs = @()
             foreach ($rawLine in $batch) {
-                $batchJobs += Start-ThreadJob -ThrottleLimit $script:throttle -ArgumentList $rawLine, $script:server, $script:share, $script:timestamp, $script:fileKey, $script:lock, $script:keywords, $script:fileExtensions, $script:outputCsvFile, $script:dbPath, $script:tableName, $script:fileCounter, $totalFiles -ScriptBlock {
+                $batchJobs += Start-ThreadJob -ThrottleLimit $script:throttle -ArgumentList $rawLine, $script:server, $script:share, $script:timestamp, $script:fileKey, $script:fileCounter -ScriptBlock {
 
                     $rawLine        = $args[0]
                     $server         = $args[1]
                     $share          = $args[2]
                     $timestamp      = $args[3]
                     $fileKey        = $args[4]
-                    $lock           = $args[5]
-                    $keywords       = $args[6]
-                    $fileExtensions = $args[7]
-                    $outputCsvFile  = $args[8]
-                    $dbPath         = $args[9]
-                    $tableName      = $args[10]
-                    $fileCounter    = $args[11]
-                    $totalFiles     = $args[12]
+                    $keywords       = $using:keywords
+                    $fileExtensions = $using:fileExtensions
+                    $fileCounter    = $args[5]
+                    
 
                     # Parse raw line into file object
                     if ($rawLine -notmatch '^(\d+)\s+(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})\s+(\\\\[^\s].+)$') { return }
@@ -285,7 +281,8 @@ foreach ($server in $servers) {
                     # increment counter and enqueue log
                     $count = $fileCounter.AddOrUpdate($fileKey, 1, [Func[string,int,int]]{ param($k,$v) $v+1 })
                     $writeQueue = $using:writeQueue
-                    $writeQueue.Enqueue("   Scanning $($file.FullName)...")
+                    #comment this line out for less spam. it prints to console.
+                    #$writeQueue.Enqueue("   Scanning $($file.FullName)...")
 
                     try {
                         # ── 1. Filename keyword scan ──────────────────────────
@@ -363,9 +360,8 @@ foreach ($server in $servers) {
                         $parts = $item.Substring(7) -split '\|', 10
                         $csvLines.Add("$($parts[0]),$($parts[1]),$($parts[2]),$($parts[3]),$($parts[4]),$($parts[5]),$($parts[6]),""$($parts[7])"",""$($parts[8])"",""$($parts[9])""")
                         $inserts.Add("INSERT INTO $($script:tableName) (IP,ShareName,FileName,FilePath,CreationTime,TimeStamp,Size,Permissions,TriggerKeyword,Error) VALUES ('$($parts[0] -replace "'","''")', '$($parts[1] -replace "'","''")', '$($parts[2] -replace "'","''")', '$($parts[3] -replace "'","''")', '$($parts[4])', '$($parts[5])', '$($parts[6])', '$($parts[7] -replace "'","''")', '$($parts[8] -replace "'","''")', '$($parts[9] -replace "'","''")');")
-                    } else {
-                        # this is for printing to console the files being scanned. comment it for less spam
-                        #Write-Host $item -ForegroundColor Cyan
+                    } else {          
+                        Write-Host $item -ForegroundColor Cyan
                     }
                 }
 
