@@ -32,21 +32,10 @@ param (
 $ProgressPreference = 'Continue'
 
 $keywords = @(
-    'password','secret','confidential','private','credential','key','token','backup','export','database','db',
-    'admin','login','user','account','creditcard','ssn','id','identity','bank','finance','payroll','tax','hr',
-    'employee','insurance','medical','patient','report','statement','invoice','receipt','contract','agreement',
-    'legal','audit','access','restricted','internal','source','config','settings','environment','env','vault',
-    'master','certificate','cert','pem','pfx','ssh','rsa','pgp','gpg','recovery','restore','archive','old',
-    'temp','tmp','test','sample','prod','dev','wwwroot',
-    'oauth','jwt','saml','auth','authentication','authorization','session','cookie','bearer','clientid','clientsecret',
-    'apikey','api_key','api-token','api_token','access_token','refresh_token','security','pin','challenge','twofactor','2fa',
-    'mfa','totp','otp','aes','des','3des','blowfish','keyfile','keystore','truststore','privatekey','publickey','pubkey',
-    'keypair','passphrase','encryption','decryption','crypt','crypto','hash','salt','md5','sha1','sha256','sha512',
-    'iam','terraform','ansible','kubernetes','k8s','docker','container','compose','helm','cluster','node','pod',
-    'serviceaccount','secretmanager','keyvault','system','root','sudo','administrator','superuser','passport','dob',
-    'birthdate','address','phone','mobile','client','vendor','supplier','purchase','order','sales','transaction','payment',
-    'bill','balance','salary','wage','bonus','benefit','compensation','paystub','tin','ein','nationalid','claim','policy',
-    'health','diagnosis','treatment','prescription','doctor','nurse','appointment'
+    'password','pwd','secret','private','database','uid',
+    'admin','login','user','certificate','pfx','ssh',
+    'apikey','api_key','privatekey',
+    'secretmanager','keyvault','administrator','superuser','passport'
 )
 
 $fileExtensions = @(
@@ -121,7 +110,7 @@ function Get-AllFiles {
         [Parameter(Mandatory)]
         [string]$RootPath,
         [ref]$ErrorList,
-        [int]$BatchSize = 10000,
+        [int]$BatchSize = 1000,
         [scriptblock]$OnBatch
     )
 
@@ -251,7 +240,7 @@ foreach ($server in $servers) {
         $fileJobs = @()
         $fileCounter[$fileKey] = 0
 
-        Get-AllFiles -RootPath $searchPath -ErrorList ([ref]$problems) -BatchSize 10000 -OnBatch {
+        Get-AllFiles -RootPath $searchPath -ErrorList ([ref]$problems) -BatchSize 1000 -OnBatch {
             param($batch, $totalFiles)
 
             $batchJobs = @()
